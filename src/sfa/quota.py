@@ -12,8 +12,10 @@ rolls over automatically at reset time.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,7 +64,24 @@ class QuotaTracker:
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
-        self._load()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._locked():
+            self._load()
+
+    # ---- locking ---------------------------------------------------------
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".lock")
+
+    @contextmanager
+    def _locked(self):
+        """Exclusive advisory lock so two processes never lose an increment."""
+        with open(self.lock_path, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     # ---- persistence -----------------------------------------------------
     def _load(self) -> None:
@@ -102,14 +121,19 @@ class QuotaTracker:
         return COST[method] * n_calls <= self.remaining
 
     def reserve(self, method: str) -> int:
-        """Charge ``method``'s cost. Raises :class:`QuotaExhausted` if it does not fit."""
+        """Charge ``method``'s cost. Raises :class:`QuotaExhausted` if it does not fit.
+
+        Load -> add -> save happens under the file lock, so concurrent
+        processes sharing the same quota file cannot lose an increment.
+        """
         cost = COST[method]
-        self._rollover_if_needed()
-        if cost > self.remaining:
-            raise QuotaExhausted(method, cost, self)
-        self._used += cost
-        self._calls += 1
-        self._save()
+        with self._locked():
+            self._load()  # re-read: another process may have spent units
+            if cost > max(0, self.budget - self._used):
+                raise QuotaExhausted(method, cost, self)
+            self._used += cost
+            self._calls += 1
+            self._save()
         return cost
 
     def reset_time_jst(self) -> datetime:

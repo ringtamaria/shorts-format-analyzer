@@ -37,3 +37,31 @@ def test_rollover_on_new_pacific_date(tmp_path):
 
 def test_costs_match_official_table():
     assert COST["search.list"] == 100 and COST["videos.list"] == 1 and COST["captions.list"] == 50
+
+
+def _spend(args):
+    path, n = args
+    from sfa.quota import QuotaTracker
+    q = QuotaTracker(path, budget=10_000)
+    for _ in range(n):
+        q.reserve("videos.list")
+    return q.used
+
+
+def test_concurrent_processes_do_not_lose_increments(tmp_path):
+    import multiprocessing as mp
+    p = tmp_path / "q.json"
+    QuotaTracker(p, budget=10_000)
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(4) as pool:
+        pool.map(_spend, [(str(p), 50)] * 4)
+    assert QuotaTracker(p, budget=10_000).used == 200
+
+
+def test_exhaustion_check_uses_fresh_file_state(tmp_path):
+    p = tmp_path / "q.json"
+    a = QuotaTracker(p, budget=150)
+    b = QuotaTracker(p, budget=150)
+    a.reserve("search.list")
+    with pytest.raises(QuotaExhausted):  # b's in-memory view was 0, file says 100
+        b.reserve("search.list")

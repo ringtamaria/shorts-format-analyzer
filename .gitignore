@@ -24,3 +24,9 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# operational rules (kept out of the public repo; see config/rules.example.yaml)
+config/rules.yaml
+
+# quota lock file
+*.lock

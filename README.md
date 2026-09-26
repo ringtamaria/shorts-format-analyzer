@@ -50,7 +50,8 @@ python scripts/build_report.py --genre "レシピ 料理" --n 100
 | `captions.list` | **50** / 本 | 高い。Phase A のサンプル調査のみ |
 
 使用量は `data/quota.json` に永続記録し、`YOUTUBE_DAILY_QUOTA - YOUTUBE_QUOTA_SAFETY_MARGIN` を
-超えそうな呼び出しは行わずに正常終了する。
+超えそうな呼び出しは行わずに正常終了する。更新はファイルロック（`flock`）で排他しており、
+2 つのターミナルで同時に走らせても使用量を取りこぼさない。
 
 ### 字幕の取得手段（`TRANSCRIPT_BACKEND`）
 
@@ -68,6 +69,27 @@ python scripts/build_report.py --genre "レシピ 料理" --n 100
 
 - API キーは `.env` にだけ置く。`.gitignore` で除外済み。
 - 取得したデータ（`data/`）と生成物（`out/`）もコミットしない。
+- コミットの著者は GitHub の noreply アドレスを使う（`git config --local user.email`）。実メールを履歴に入れない。
+
+## 判定ルール（`config/`）
+
+冒頭タイプの正規表現、ブランド名リスト、CTA 動詞、結論マーカー、各種閾値はコードに書かず、YAML から読む。
+
+| ファイル | 用途 |
+|---|---|
+| `config/rules.example.yaml` | コミットする汎用の最小セット。クローン直後はこれで動く |
+| `config/rules.yaml` | 実運用のルール。**`.gitignore` 済み**でコミットされない |
+
+ローダー（`src/sfa/rules.py`）は `rules.yaml` があればそれを、なければ `rules.example.yaml` を使う。
+`rules.yaml` がなくてもテストは通る。ブランド名リストはジャンルに応じて `rules.yaml` に追記する。
+
+## レポートの数値表記
+
+- 数値は四分位範囲（Q1〜Q3）で出し、括弧内に中央値を添える。例: `20〜34秒（中央値27秒）`
+- 位置は 前半（0〜33%）／中盤（34〜66%）／後半（67〜100%）の区分名に範囲を添える。例: `後半（65〜80%地点）`
+- 5 本未満のクラスタは範囲を出さず「n=3 のため傾向の参考値」と明記する
+- 該当動画の URL は再生数上位 3 本に固定し、残りは本数のみ書く
+- 検索はセーフサーチ無効なので、**掲載 URL は納品前に目視確認する**（レポート末尾にも記載される）
 
 ## 構成
 
@@ -78,9 +100,12 @@ src/sfa/
   youtube.py      Data API クライアント（quota 経由でしか呼べない）
   store.py        SQLite キャッシュ
   transcript/     get_transcript() の共通インターフェースと local / hosted / null 実装
+  rules.py        config/ の判定ルールを読み込む
   features.py     構成の特徴量抽出（制作者が真似できる単位）
   formats.py      クラスタリングとフォーマット命名（LLM、なければルールベース）
   report.py       Markdown レポート生成
+config/
+  rules.example.yaml  判定ルールの汎用セット（rules.yaml は git-ignore）
 scripts/
   check_captions.py   Phase A
   build_report.py     end-to-end

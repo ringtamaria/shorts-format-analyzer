@@ -4,9 +4,13 @@ can act on ("冒頭3秒クローズアップ型", not "cluster 3").
 Pipeline
   1. standardise feature vectors (only videos that have a transcript)
   2. KMeans, k chosen by silhouette in a small range
-  3. build a numeric profile per cluster (medians / shares)
-  4. name each cluster: LLM if ANTHROPIC_API_KEY is set, else rule-based
+  3. build a numeric profile per cluster: quartile ranges (Q1-median-Q3), shares
+  4. name each cluster: LLM if available, else rule-based
 Videos without transcripts are reported separately from metadata only.
+
+Numbers are reported as ranges, never as a single point: with ~15 videos per
+cluster a lone median reads as a target it is not. Clusters smaller than
+``rules.min_cluster_for_ranges`` are flagged as reference-only.
 """
 from __future__ import annotations
 
@@ -14,12 +18,14 @@ import json
 import re
 import statistics
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
-from .features import Features, OPENING_TYPES
+from .features import Features, get_rules, position_label
+from .rules import Rules
 
 MIN_VIDEOS_FOR_CLUSTERING = 6
+N_EXAMPLES = 3
 
 
 @dataclass
@@ -31,8 +37,12 @@ class FormatCluster:
     size: int
     share: float
     profile: dict[str, Any]
-    examples: list[dict[str, Any]]  # [{title, url, view_count, duration_sec}]
+    examples: list[dict[str, Any]]  # top N_EXAMPLES by views: [{title, url, view_count, duration_sec}]
     naming_source: str = "rule"     # rule | llm
+
+    @property
+    def small_sample(self) -> bool:
+        return bool(self.profile.get("small_sample"))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -48,14 +58,15 @@ def _standardise(rows: list[list[float]]) -> list[list[float]]:
     return ((X - mu) / sd).tolist()
 
 
-def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int = 6, seed: int = 0) -> list[int]:
+def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int = 6, seed: int = 0,
+                     rules: Rules | None = None) -> list[int]:
     """Return a cluster label per feature row (same order). Single cluster when too few rows."""
     n = len(feats)
     if n < MIN_VIDEOS_FOR_CLUSTERING:
         return [0] * n
     from sklearn.cluster import KMeans
     from sklearn.metrics import silhouette_score
-    X = _standardise([f.vector() for f in feats])
+    X = _standardise([f.vector(rules) for f in feats])
     if k is None:
         best_k, best_s = 2, -1.0
         for kk in range(2, min(max_k, n // 3) + 1):
@@ -71,38 +82,49 @@ def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int 
 
 # ---- profiling -------------------------------------------------------------
 
+def quartiles(xs: list[float], nd: int = 2) -> dict[str, float] | None:
+    """{"q1", "median", "q3", "n"} or None when empty."""
+    xs = [float(x) for x in xs]
+    if not xs:
+        return None
+    if len(xs) == 1:
+        v = round(xs[0], nd)
+        return {"q1": v, "median": v, "q3": v, "n": 1}
+    q1, med, q3 = statistics.quantiles(xs, n=4, method="inclusive")
+    return {"q1": round(q1, nd), "median": round(med, nd), "q3": round(q3, nd), "n": len(xs)}
+
+
 def _share(counter: Counter, total: int) -> dict[str, float]:
     return {k: round(v / total, 2) for k, v in counter.most_common()} if total else {}
 
 
-def _median(xs: list[float]) -> float:
-    return round(statistics.median(xs), 2) if xs else 0.0
+def _presence(members: list[Features], attr: str) -> dict[str, Any]:
+    vals = [getattr(m, attr) for m in members if getattr(m, attr) is not None]
+    q = quartiles(vals, 3)
+    return {
+        "share": round(len(vals) / len(members), 2) if members else 0.0,
+        "pos": q,
+        "label": position_label(q["median"]) if q else "なし",
+    }
 
 
-def profile_cluster(members: list[Features]) -> dict[str, Any]:
+def profile_cluster(members: list[Features], rules: Rules | None = None) -> dict[str, Any]:
+    r = rules or get_rules()
     n = len(members)
-    with_c = [m for m in members if m.conclusion_rel is not None]
-    with_q = [m for m in members if m.question_rel is not None]
-    with_cta = [m for m in members if m.cta_rel is not None]
     return {
         "n": n,
-        "duration_median_sec": _median([m.duration_sec for m in members]),
-        "duration_p25_p75": [
-            _median(sorted(m.duration_sec for m in members)[: max(1, n // 2)]),
-            _median(sorted(m.duration_sec for m in members)[n // 2:]),
-        ],
-        "speech_density_median": _median([m.speech_density for m in members]),
-        "topic_shifts_median": _median([m.n_topic_shifts for m in members]),
+        "small_sample": n < r.min_cluster_for_ranges,
+        "duration": quartiles([m.duration_sec for m in members], 0),
+        "speech_density": quartiles([m.speech_density for m in members], 1),
+        "topic_shifts": quartiles([m.n_topic_shifts for m in members], 0),
         "opening_type": _share(Counter(m.opening_type for m in members), n),
         "opening_examples": list(dict.fromkeys(m.opening_text for m in members if m.opening_text))[:5],
         "conclusion_pos": _share(Counter(m.conclusion_pos for m in members), n),
-        "conclusion_rel_median": _median([m.conclusion_rel for m in with_c]) if with_c else None,
-        "question_share": round(len(with_q) / n, 2) if n else 0,
-        "question_rel_median": _median([m.question_rel for m in with_q]) if with_q else None,
-        "cta_share": round(len(with_cta) / n, 2) if n else 0,
-        "cta_rel_median": _median([m.cta_rel for m in with_cta]) if with_cta else None,
+        "conclusion": _presence(members, "conclusion_rel"),
+        "question": _presence(members, "question_rel"),
+        "cta": _presence(members, "cta_rel"),
         "title_type": _share(Counter(m.title_type for m in members), n),
-        "view_median": _median([m.view_count for m in members]),
+        "view_median": quartiles([m.view_count for m in members], 0),
     }
 
 
@@ -110,23 +132,49 @@ def _dominant(share: dict[str, float]) -> str:
     return next(iter(share), "その他") if share else "その他"
 
 
-def rule_based_name(p: dict[str, Any]) -> tuple[str, str, list[str]]:
-    """Fallback naming from the profile alone. Concrete, no adjectives."""
+# ---- text helpers shared with report.py ------------------------------------
+
+def fmt_range(q: dict[str, float] | None, unit: str = "", *, small: bool = False, nd: int = 0) -> str:
+    """'20〜34秒（中央値27秒）'; small samples show the median only, marked as reference."""
+    if q is None:
+        return "なし"
+    f = (lambda x: f"{x:.{nd}f}")
+    if small:
+        return f"中央値{f(q['median'])}{unit}（参考値）"
+    return f"{f(q['q1'])}〜{f(q['q3'])}{unit}（中央値{f(q['median'])}{unit}）"
+
+
+def fmt_position(p: dict[str, Any], *, small: bool = False) -> str:
+    """'後半（65〜80%地点）' from a presence dict; '' when absent."""
+    q = p.get("pos")
+    if not q:
+        return "なし"
+    pct = lambda x: f"{int(round(x * 100))}"  # noqa: E731
+    if small:
+        return f"{p['label']}（{pct(q['median'])}%地点、参考値）"
+    return f"{p['label']}（{pct(q['q1'])}〜{pct(q['q3'])}%地点）"
+
+
+def rule_based_name(p: dict[str, Any], rules: Rules | None = None) -> tuple[str, str, list[str]]:
+    """Fallback naming from the profile alone. Concrete, ranges, no adjectives."""
+    r = rules or get_rules()
+    small = bool(p.get("small_sample"))
     opening = _dominant(p["opening_type"])
-    concl = _dominant(p["conclusion_pos"])
-    dur = int(p["duration_median_sec"])
-    name = f"冒頭{opening}・結論{concl}型" if concl != "なし" else f"冒頭{opening}・展開型"
-    one_line = (f"0〜3秒で{opening}、結論は{concl}に置く、尺は約{dur}秒、"
-                f"話題転換は中央値{int(p['topic_shifts_median'])}回")
-    recipe = [f"0〜3秒: {opening}で入る（例: {p['opening_examples'][0]}）" if p["opening_examples"] else f"0〜3秒: {opening}で入る"]
-    if p["conclusion_rel_median"] is not None:
-        recipe.append(f"結論・完成の提示: 尺の{int(p['conclusion_rel_median'] * 100)}%地点（約{int(dur * p['conclusion_rel_median'])}秒）")
-    if p["question_share"] >= 0.5 and p["question_rel_median"] is not None:
-        recipe.append(f"問いかけ: {int(p['question_share'] * 100)}%の動画にあり、尺の{int(p['question_rel_median'] * 100)}%地点")
-    if p["cta_share"] >= 0.5 and p["cta_rel_median"] is not None:
-        recipe.append(f"CTA: {int(p['cta_share'] * 100)}%の動画にあり、尺の{int(p['cta_rel_median'] * 100)}%地点")
-    recipe.append(f"話題転換: 中央値{int(p['topic_shifts_median'])}回、発話密度: {p['speech_density_median']}文字/秒")
-    recipe.append(f"尺: 中央値{dur}秒（四分位 {int(p['duration_p25_p75'][0])}〜{int(p['duration_p25_p75'][1])}秒）")
+    concl_label = p["conclusion"]["label"]
+    dur = p["duration"]
+    name = f"冒頭{opening}・結論{concl_label}型" if concl_label != "なし" else f"冒頭{opening}・展開型"
+    one_line = (f"0〜{int(r.opening_window_sec)}秒で{opening}、結論は{fmt_position(p['conclusion'], small=small)}、"
+                f"尺は{fmt_range(dur, '秒', small=small)}")
+    ex = p["opening_examples"][0] if p["opening_examples"] else None
+    recipe = [f"0〜{int(r.opening_window_sec)}秒: {opening}で入る" + (f"（例: {ex}）" if ex else "")]
+    if p["conclusion"]["pos"]:
+        recipe.append(f"結論・完成の提示: 尺の{fmt_position(p['conclusion'], small=small)}")
+    for key, label in (("question", "問いかけ"), ("cta", "CTA")):
+        if p[key]["share"] >= r.presence_share and p[key]["pos"]:
+            recipe.append(f"{label}: {int(p[key]['share'] * 100)}%の動画にあり、尺の{fmt_position(p[key], small=small)}")
+    recipe.append(f"話題転換: {fmt_range(p['topic_shifts'], '回', small=small)}、"
+                  f"発話密度: {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)}")
+    recipe.append(f"尺: {fmt_range(dur, '秒', small=small)}")
     recipe.append(f"タイトル: {_dominant(p['title_type'])}が最多")
     return name, one_line, recipe
 
@@ -140,7 +188,10 @@ LLM_SYSTEM = """あなたはショート動画の構成分析を、企業のSNS�
 厳守事項:
 - 名前は「冒頭3秒クローズアップ型」「Before/After反転型」「数値訴求型」のような粒度の日本語。末尾は「型」。
 - 抽象的な形容詞（インパクトのある、テンポの良い、魅力的、面白い 等）は禁止。秒数・語順・構造で書く。
-- recipe は 3〜6 行。各行は「0〜3秒: 〜」「尺の40%地点で〜」のように、時間か順序を含む。
+- 数値は必ず範囲で書く。プロファイルの q1〜q3 を「20〜34秒」「尺の65〜80%地点」の形で使い、中央値を単独の目標値として書かない。
+- 位置は 前半（0〜33%）／中盤（34〜66%）／後半（67〜100%）の区分名に範囲を添える。例: 「後半（65〜80%地点）」
+- small_sample が true のグループは、範囲を出さず「n=◯ のため傾向の参考値」と one_line の冒頭に書く。
+- recipe は 3〜6 行。各行は「0〜3秒: 〜」「尺の40〜55%地点で〜」のように、時間か順序を含む。
 - プロファイルにない事実を作らない。数値はプロファイルの値をそのまま使う。
 - 出力は JSON のみ。説明文やコードフェンスを付けない。
 
@@ -192,22 +243,23 @@ def llm_name_clusters(profiles: list[dict[str, Any]], *, model: str, api_key: st
 
 def extract_formats(feats: list[Features], *, genre: str = "", llm_model: str | None = None,
                     anthropic_api_key: str | None = None, use_llm: bool = True,
-                    k: int | None = None) -> tuple[list[FormatCluster], list[Features], str | None]:
+                    k: int | None = None, rules: Rules | None = None
+                    ) -> tuple[list[FormatCluster], list[Features], str | None]:
     """Returns (clusters, videos_without_transcript, llm_error_or_None)."""
+    r = rules or get_rules()
     with_tr = [f for f in feats if f.has_transcript]
     without = [f for f in feats if not f.has_transcript]
     if not with_tr:
         return [], without, None
 
-    labels = cluster_features(with_tr, k=k)
+    labels = cluster_features(with_tr, k=k, rules=r)
     groups: dict[int, list[Features]] = {}
     for f, lab in zip(with_tr, labels):
         groups.setdefault(lab, []).append(f)
-    # Renumber clusters by size, largest first.
-    ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # largest first
     profiles: list[dict[str, Any]] = []
     for new_id, (_, members) in enumerate(ordered):
-        p = profile_cluster(members)
+        p = profile_cluster(members, r)
         p["cluster_id"] = new_id
         profiles.append(p)
 
@@ -227,9 +279,9 @@ def extract_formats(feats: list[Features], *, genre: str = "", llm_model: str | 
             name, one_line, recipe = names[new_id]
             src = "llm"
         else:
-            name, one_line, recipe = rule_based_name(p)
+            name, one_line, recipe = rule_based_name(p, r)
             src = "rule"
-        examples = sorted(members, key=lambda m: -m.view_count)[:3]
+        examples = sorted(members, key=lambda m: -m.view_count)[:N_EXAMPLES]
         clusters.append(FormatCluster(
             cluster_id=new_id, name=name, one_line=one_line, recipe=recipe,
             size=len(members), share=round(len(members) / total, 2), profile=p,
