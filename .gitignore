@@ -1,0 +1,26 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# fetched data / generated outputs (never commit)
+data/
+out/
+*.db
+*.sqlite
+*.sqlite3
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
