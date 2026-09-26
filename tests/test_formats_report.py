@@ -31,6 +31,21 @@ def test_quartiles_and_formatting():
     assert fmt_position(pres) == "後半（65〜80%地点）"
     assert fmt_position(pres, small=True) == "後半（71%地点、参考値）"
     assert quartiles([5], 0) == {"q1": 5, "median": 5, "q3": 5, "n": 1}
+    assert fmt_range(quartiles([5, 5, 5], 0), "秒") == "5秒（全本ほぼ同値）"
+    assert fmt_position({"label": "前半", "pos": {"q1": 0.0, "median": 0.0, "q3": 0.0, "n": 3}}) == "前半（0%地点）"
+
+
+def test_colliding_rule_names_are_disambiguated_by_duration():
+    feats = []
+    for i in range(1, 7):
+        v = make_video(i, duration=20, views=i)
+        feats.append(extract_features(v, make_transcript(v.video_id, QUESTION_OPEN, seg_dur=20 / 6)))
+    for i in range(7, 13):
+        v = make_video(i, duration=55, views=i)
+        feats.append(extract_features(v, make_transcript(v.video_id, QUESTION_OPEN, seg_dur=55 / 6)))
+    clusters, _, _ = extract_formats(feats, use_llm=False, k=2)
+    names = [c.name for c in clusters]
+    assert len(set(names)) == 2 and all("秒前後" in n for n in names)
 
 
 def test_profile_uses_ranges_and_flags_small_samples():

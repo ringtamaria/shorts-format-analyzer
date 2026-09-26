@@ -141,6 +141,8 @@ def fmt_range(q: dict[str, float] | None, unit: str = "", *, small: bool = False
     f = (lambda x: f"{x:.{nd}f}")
     if small:
         return f"中央値{f(q['median'])}{unit}（参考値）"
+    if f(q["q1"]) == f(q["q3"]):
+        return f"{f(q['median'])}{unit}（全本ほぼ同値）"
     return f"{f(q['q1'])}〜{f(q['q3'])}{unit}（中央値{f(q['median'])}{unit}）"
 
 
@@ -152,6 +154,8 @@ def fmt_position(p: dict[str, Any], *, small: bool = False) -> str:
     pct = lambda x: f"{int(round(x * 100))}"  # noqa: E731
     if small:
         return f"{p['label']}（{pct(q['median'])}%地点、参考値）"
+    if pct(q["q1"]) == pct(q["q3"]):
+        return f"{p['label']}（{pct(q['median'])}%地点）"
     return f"{p['label']}（{pct(q['q1'])}〜{pct(q['q3'])}%地点）"
 
 
@@ -273,14 +277,21 @@ def extract_formats(feats: list[Features], *, genre: str = "", llm_model: str | 
 
     clusters: list[FormatCluster] = []
     total = len(with_tr)
-    for new_id, (_, members) in enumerate(ordered):
+    resolved: list[tuple[str, str, list[str], str]] = []
+    for new_id in range(len(ordered)):
         p = profiles[new_id]
         if new_id in names:
-            name, one_line, recipe = names[new_id]
-            src = "llm"
+            resolved.append((*names[new_id], "llm"))
         else:
-            name, one_line, recipe = rule_based_name(p, r)
-            src = "rule"
+            resolved.append((*rule_based_name(p, r), "rule"))
+    # Rule-based names can collide (same opening, same conclusion band); tell them apart by length.
+    counts = Counter(n for n, _, _, _ in resolved)
+    for new_id, (name, one_line, recipe, src) in enumerate(resolved):
+        if counts[name] > 1 and src == "rule" and profiles[new_id]["duration"]:
+            resolved[new_id] = (f"{name}（{int(profiles[new_id]['duration']['median'])}秒前後）", one_line, recipe, src)
+    for new_id, (_, members) in enumerate(ordered):
+        p = profiles[new_id]
+        name, one_line, recipe, src = resolved[new_id]
         examples = sorted(members, key=lambda m: -m.view_count)[:N_EXAMPLES]
         clusters.append(FormatCluster(
             cluster_id=new_id, name=name, one_line=one_line, recipe=recipe,
