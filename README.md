@@ -86,3 +86,11 @@ scripts/
   build_report.py     end-to-end
 tests/
 ```
+
+## テスト
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+ネットワークも API キーも使わず、YouTube API を偽装した end-to-end テストを含む。
