@@ -94,7 +94,7 @@ def profile_cluster(members: list[Features]) -> dict[str, Any]:
         "speech_density_median": _median([m.speech_density for m in members]),
         "topic_shifts_median": _median([m.n_topic_shifts for m in members]),
         "opening_type": _share(Counter(m.opening_type for m in members), n),
-        "opening_examples": [m.opening_text for m in members if m.opening_text][:5],
+        "opening_examples": list(dict.fromkeys(m.opening_text for m in members if m.opening_text))[:5],
         "conclusion_pos": _share(Counter(m.conclusion_pos for m in members), n),
         "conclusion_rel_median": _median([m.conclusion_rel for m in with_c]) if with_c else None,
         "question_share": round(len(with_q) / n, 2) if n else 0,
