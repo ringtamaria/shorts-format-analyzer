@@ -146,7 +146,8 @@ class YouTubeClient:
 
     # ---- methods ---------------------------------------------------------
     def search_video_ids(self, query: str, *, max_results: int = 50, page_token: str | None = None,
-                         order: str = "viewCount", published_after: str | None = None) -> tuple[list[str], str | None]:
+                         order: str = "viewCount", published_after: str | None = None,
+                         published_before: str | None = None) -> tuple[list[str], str | None]:
         """search.list (100 units). Returns (video_ids, next_page_token).
 
         ``videoDuration=short`` restricts to < 4 minutes; callers must still
@@ -163,10 +164,39 @@ class YouTubeClient:
             "regionCode": self.region_code,
             "relevanceLanguage": self.relevance_language,
             "publishedAfter": published_after,
+            "publishedBefore": published_before,
             "safeSearch": "none",
         })
         ids = [it["id"]["videoId"] for it in data.get("items", []) if it.get("id", {}).get("videoId")]
         return ids, data.get("nextPageToken")
+
+    def uploads_playlists(self, channel_ids: list[str]) -> dict[str, str]:
+        """channels.list (1 unit per 50 ids) -> {channel_id: uploads playlist id}."""
+        out: dict[str, str] = {}
+        for i in range(0, len(channel_ids), 50):
+            data = self._get("channels.list", {"part": "contentDetails", "id": ",".join(channel_ids[i:i + 50]),
+                                               "maxResults": 50})
+            for it in data.get("items", []):
+                pid = it.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+                if pid:
+                    out[it["id"]] = pid
+        return out
+
+    def playlist_items(self, playlist_id: str, *, page_token: str | None = None
+                       ) -> tuple[list[tuple[str, str]], str | None]:
+        """playlistItems.list (1 unit, up to 50) -> ([(video_id, videoPublishedAt), ...], next_page_token).
+
+        Uploads playlists are newest first, so callers can stop paging once
+        items are older than their window.
+        """
+        data = self._get("playlistItems.list", {"part": "contentDetails", "playlistId": playlist_id,
+                                                "maxResults": 50, "pageToken": page_token})
+        items = []
+        for it in data.get("items", []):
+            cd = it.get("contentDetails", {})
+            if cd.get("videoId"):
+                items.append((cd["videoId"], cd.get("videoPublishedAt", "")))
+        return items, data.get("nextPageToken")
 
     def list_videos(self, video_ids: list[str]) -> list[Video]:
         """videos.list (1 unit per 50 ids)."""

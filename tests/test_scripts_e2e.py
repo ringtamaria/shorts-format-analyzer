@@ -137,3 +137,117 @@ def test_build_report_without_anthropic_key_never_calls_llm(env_tmp, fake_api, c
     import build_report
     assert build_report.main(["--genre", "レシピ 料理", "--n", "20"]) == 0
     assert "rule-based format names" in capsys.readouterr().out
+
+
+# ---- round 3 -----------------------------------------------------------------
+
+class ChannelAPI(FakeAPI):
+    """Adds channels.list / playlistItems.list; search.list must not be used."""
+
+    def __call__(self, client, method, params):
+        if method == "search.list":
+            raise AssertionError("search.list must not be called on the channels route")
+        if method == "channels.list":
+            client.quota.reserve(method)
+            self.calls.append(method)
+            ids = params["id"].split(",")
+            return {"items": [{"id": c, "contentDetails": {"relatedPlaylists": {"uploads": "UU" + c[2:]}}} for c in ids]}
+        if method == "playlistItems.list":
+            client.quota.reserve(method)
+            self.calls.append(method)
+            base = 100 if params["playlistId"].endswith("a") else 200
+            return {"items": [{"contentDetails": {"videoId": f"v{base + j:03d}",
+                                                  "videoPublishedAt": f"2026-09-{(j % 28) + 1:02d}T00:00:00Z"}}
+                              for j in range(30)]}
+        return super().__call__(client, method, params)
+
+
+def _write_channels(env_tmp, monkeypatch):
+    p = env_tmp / "channels.yaml"
+    p.write_text("genres:\n  レシピ 料理:\n    - id: UC" + "a" * 22 + "\n      name: A\n    - id: UC" + "b" * 22 + "\n",
+                 encoding="utf-8")
+    monkeypatch.setenv("SFA_CHANNELS_PATH", str(p))
+
+
+def test_channels_route_uses_playlist_items_not_search(env_tmp, capsys, monkeypatch):
+    api = ChannelAPI()
+    monkeypatch.setattr(youtube.YouTubeClient, "_get", lambda self, m, p: api(self, m, p))
+    _write_channels(env_tmp, monkeypatch)
+    import build_report
+    rc = build_report.main(["--genre", "レシピ 料理", "--n", "40", "--no-llm",
+                            "--published-after", "2026-09-10T00:00:00Z"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "route=channels" in out
+    assert "search.list" not in api.calls and api.calls.count("playlistItems.list") == 2
+    feats = json.loads(next((env_tmp / "out").glob("*.features.json")).read_text())["features"]
+    # in window (published on/after 09-10) and not >3 min (ids divisible by 10 are 5-minute videos)
+    expected = sum(1 for base in (100, 200) for j in range(30)
+                   if (j % 28) + 1 >= 10 and (base + j) % 10 != 0)
+    assert len(feats) == expected == 34
+    md = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "チャンネル起点" in md and "publishedAfter=2026-09-10" in md
+
+
+def test_search_route_when_channels_file_missing(env_tmp, fake_api, capsys, monkeypatch):
+    monkeypatch.setenv("SFA_CHANNELS_PATH", str(env_tmp / "missing.yaml"))
+    import build_report
+    assert build_report.main(["--genre", "レシピ 料理", "--n", "20", "--no-llm"]) == 0
+    assert "route=search" in capsys.readouterr().out and "search.list" in fake_api.calls
+
+
+class ScriptedBackend:
+    name = "hosted"
+
+    def __init__(self, credits=None, langs=None):
+        self.calls, self.credits, self.langs = [], credits, langs or {}
+
+    def fetch(self, vid):
+        if self.credits is not None:
+            self.credits.reserve("transcript")
+        self.calls.append(vid)
+        from sfa.transcript import Transcript, Segment
+        lang = self.langs.get(vid, "ja")
+        return Transcript(vid, lang, [Segment(0, 3, "3分でできる"), Segment(3, 20, "まず切る"), Segment(23, 5, "完成")], "hosted")
+
+
+def _use_backend(monkeypatch, be):
+    import build_report
+    monkeypatch.setattr(build_report, "make_backend", lambda s: be)
+    monkeypatch.setenv("TRANSCRIPT_BACKEND", "hosted")
+    return build_report
+
+
+def test_hosted_skips_cached_and_known_no_caption_and_filters_language(env_tmp, fake_api, capsys, monkeypatch):
+    from sfa.store import Store
+    s = Store(env_tmp / "sfa.db")
+    s.put_transcript("v001", "local", "ok", language="ja", segments=[{"start": 0, "duration": 3, "text": "知ってる？"}])
+    s.put_transcript("v002", "local", "unavailable", error="TranscriptsDisabled")
+    s.put_caption_check("v003", [])                         # captions.list: no tracks
+    s.put_caption_check("v004", [{"language": "ja", "trackKind": "asr"}])
+    s.close()
+    fake_api.n_pages = 1  # one search page: v000-v049, so v001-v005 are inside the top 50
+    be = ScriptedBackend(langs={"v005": "en"})
+    build_report = _use_backend(monkeypatch, be)
+    rc = build_report.main(["--genre", "レシピ 料理", "--n", "50", "--no-llm"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    asked = set(be.calls)
+    assert not asked & {"v001", "v002", "v003"}       # cached ok / known unavailable / no tracks
+    assert "v004" in asked and "v005" in asked
+    md = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "日本語以外だった 1 本を除き" in md and "分析対象から除外" in md
+    feats = json.loads(next((env_tmp / "out").glob("*.features.json")).read_text())
+    assert "v005" in feats["lang_excluded"] and all(f["video_id"] != "v005" for f in feats["features"])
+
+
+def test_hosted_credit_exhaustion_is_a_graceful_partial_report(env_tmp, fake_api, capsys, monkeypatch):
+    from sfa.quota import CreditTracker
+    credits = CreditTracker(env_tmp / "credits.json", 3)
+    be = ScriptedBackend(credits=credits)
+    build_report = _use_backend(monkeypatch, be)
+    rc = build_report.main(["--genre", "レシピ 料理", "--n", "10", "--no-llm"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "[stop]" in out and len(be.calls) == 3
+    md = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "クレジット上限に達した" in md and "1日あたりの上限" not in md

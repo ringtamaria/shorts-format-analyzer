@@ -31,6 +31,11 @@ class Settings:
     db_path: Path
     quota_path: Path
     out_dir: Path
+    supadata_api_key: str = ""
+    supadata_monthly_credits: int = 100
+    supadata_credits_path: Path = ROOT / "data" / "supadata_credits.json"
+    transcript_lang: str = "ja"
+    channels_path: Path = ROOT / "config" / "channels.yaml"
 
     @property
     def quota_budget(self) -> int:
@@ -51,7 +56,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
     """
     load_dotenv(env_file or ROOT / ".env", override=False)
     env = os.environ
-    backend = env.get("TRANSCRIPT_BACKEND", "local").strip().lower()
+    backend = env.get("TRANSCRIPT_BACKEND", "hosted").strip().lower()
     if backend not in {"local", "hosted", "null"}:
         raise ValueError(f"TRANSCRIPT_BACKEND must be local|hosted|null, got {backend!r}")
     return Settings(
@@ -68,4 +73,9 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         db_path=_resolve(env.get("SFA_DB_PATH", "data/sfa.db")),
         quota_path=_resolve(env.get("SFA_QUOTA_PATH", "data/quota.json")),
         out_dir=_resolve(env.get("SFA_OUT_DIR", "out")),
+        supadata_api_key=env.get("SUPADATA_API_KEY", "").strip(),
+        supadata_monthly_credits=int(env.get("SUPADATA_MONTHLY_CREDITS", "100")),
+        supadata_credits_path=_resolve(env.get("SUPADATA_CREDITS_PATH", "data/supadata_credits.json")),
+        transcript_lang=env.get("TRANSCRIPT_LANG", "ja").strip().lower() or "ja",
+        channels_path=_resolve(env.get("SFA_CHANNELS_PATH", "config/channels.yaml")),
     )

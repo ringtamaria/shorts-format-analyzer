@@ -152,3 +152,74 @@ class QuotaTracker:
             f"Daily quota budget reached. Fetched data is cached in SQLite, so re-run the same "
             f"command after {self.reset_time_jst():%m/%d %H:%M} JST to continue where it stopped."
         )
+
+
+def jst_month(now: datetime | None = None) -> str:
+    now = now or datetime.now(tz=timezone.utc)
+    return now.astimezone(JST).strftime("%Y-%m")
+
+
+class CreditTracker(QuotaTracker):
+    """Monthly credit ledger for a paid API (Supadata), same contract as QuotaTracker.
+
+    * period = calendar month in JST (Supadata's own cycle may differ; we
+      reset on the 1st, which is never later than theirs for a free plan)
+    * one credit per transcript request (``reserve("transcript")``)
+    * raises :class:`QuotaExhausted` when the monthly budget is used up, which
+      scripts treat as a graceful stop
+    """
+
+    COSTS = {"transcript": 1}
+
+    def __init__(self, path: Path | str, budget: int, *, name: str = "supadata"):
+        self.name = name
+        super().__init__(Path(path), budget)
+
+    # period hooks ----------------------------------------------------------
+    def _period(self) -> str:
+        return jst_month()
+
+    def _load(self) -> None:
+        period = self._period()
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+            except (json.JSONDecodeError, OSError):
+                data = {}
+            if data.get("date") == period:
+                self._date, self._used, self._calls = period, int(data.get("used", 0)), int(data.get("calls", 0))
+                return
+        self._date, self._used, self._calls = period, 0, 0
+        self._save()
+
+    def _rollover_if_needed(self) -> None:
+        if self._period() != self._date:
+            with self._locked():
+                self._load()
+
+    def can_afford(self, method: str = "transcript", n_calls: int = 1) -> bool:
+        return self.COSTS[method] * n_calls <= self.remaining
+
+    def reserve(self, method: str = "transcript") -> int:
+        cost = self.COSTS[method]
+        with self._locked():
+            self._load()
+            if cost > max(0, self.budget - self._used):
+                raise QuotaExhausted(method, cost, self)
+            self._used += cost
+            self._calls += 1
+            self._save()
+        return cost
+
+    def reset_time_jst(self) -> datetime:
+        now = datetime.now(tz=JST)
+        y, m = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+        return datetime(y, m, 1, tzinfo=JST)
+
+    def status_line(self) -> str:
+        return (f"[{self.name}] used {self.used}/{self.budget} credits this month, remaining {self.remaining} "
+                f"(resets {self.reset_time_jst():%m/%d} JST)")
+
+    def resume_hint(self) -> str:
+        return (f"Monthly {self.name} credits reached. Fetched transcripts are cached, so re-run after "
+                f"{self.reset_time_jst():%Y-%m-%d} or raise SUPADATA_MONTHLY_CREDITS once on a paid plan.")

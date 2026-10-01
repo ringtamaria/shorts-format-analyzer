@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ..config import Settings
+from ..quota import QuotaExhausted
 from ..store import Store
 
 
@@ -45,6 +46,10 @@ class Transcript:
     @property
     def total_chars(self) -> int:
         return sum(len(s.text) for s in self.segments)
+
+    def is_lang(self, lang: str) -> bool:
+        """True when the transcript's (majority) language matches ``lang`` ('ja' matches 'ja-JP')."""
+        return (self.language or "").split("-")[0].lower() == lang.split("-")[0].lower()
 
     def text_between(self, t0: float, t1: float) -> str:
         return " ".join(s.text.strip() for s in self.segments if s.start < t1 and s.end > t0)
@@ -82,8 +87,10 @@ def make_backend(settings: Settings) -> TranscriptBackend:
         return LocalBackend(min_interval_sec=settings.transcript_min_interval_sec,
                             max_retries=settings.transcript_max_retries)
     if settings.transcript_backend == "hosted":
+        from ..quota import CreditTracker
         from .hosted import HostedBackend
-        return HostedBackend()
+        credits = CreditTracker(settings.supadata_credits_path, settings.supadata_monthly_credits)
+        return HostedBackend(settings.supadata_api_key, credits, lang=settings.transcript_lang)
     from .null import NullBackend
     return NullBackend()
 
@@ -113,6 +120,8 @@ class TranscriptService:
         except TranscriptBlocked:
             self.stats["blocked"] += 1
             raise  # not cached; caller stops this run
+        except QuotaExhausted:
+            raise  # credit budget reached; caller stops gracefully
         except TranscriptUnavailable as e:
             self.stats["unavailable"] += 1
             self.store.put_transcript(video_id, self.backend.name, "unavailable", error=str(e))

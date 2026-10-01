@@ -30,3 +30,4 @@ config/rules.yaml
 
 # quota lock file
 *.lock
+config/channels.yaml

@@ -74,9 +74,20 @@ class Store:
 
     # ---- searches --------------------------------------------------------
     @staticmethod
-    def search_key(query: str, order: str, page_token: str | None, published_after: str | None) -> str:
-        return json.dumps({"q": query, "order": order, "page": page_token or "", "after": published_after or ""},
-                          ensure_ascii=False, sort_keys=True)
+    def search_key(query: str, order: str, page_token: str | None, published_after: str | None,
+                   published_before: str | None = None) -> str:
+        d = {"q": query, "order": order, "page": page_token or "", "after": published_after or ""}
+        if published_before:  # only when set, so keys cached before this option existed stay valid
+            d["before"] = published_before
+        return json.dumps(d, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def playlist_key(playlist_id: str, page_token: str | None) -> str:
+        return json.dumps({"playlist": playlist_id, "page": page_token or ""}, sort_keys=True)
+
+    @staticmethod
+    def uploads_key(channel_id: str) -> str:
+        return json.dumps({"uploads_of": channel_id}, sort_keys=True)
 
     def get_search(self, key: str, *, ignore_ttl: bool = False) -> tuple[list[str], str | None] | None:
         row = self.conn.execute("SELECT * FROM searches WHERE key=?", (key,)).fetchone()

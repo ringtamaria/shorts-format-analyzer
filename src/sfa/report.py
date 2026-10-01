@@ -33,6 +33,11 @@ class ReportMeta:
     transcripts_capped: bool = False         # --max-transcripts reached
     n_transcript_unavailable: int | None = None  # video has no transcript (final)
     n_transcript_not_fetched: int | None = None  # not fetched yet: blocked / capped / transient error
+    n_lang_excluded: int = 0                 # transcript not in transcript_lang -> removed from analysis
+    transcript_lang: str = "ja"
+    collection_route: str = "search"         # search | channels
+    n_collected: int | None = None           # Shorts collected before the language filter
+    credits_exhausted: bool = False          # transcript API monthly credits reached
 
 
 def _pct(x: float) -> str:
@@ -147,15 +152,22 @@ def render_report(meta: ReportMeta, feats: list[Features], clusters: list[Format
     L.append("")
     L.append("## この資料について")
     L.append("")
-    L.append(f"検索語「{meta.genre}」で再生数上位の Shorts を {meta.n_requested} 本を目標に収集し、"
-             f"{meta.n_videos} 本を対象にした。うち字幕（発話テキスト）が取れたのは {meta.n_with_transcript} 本。")
+    collected = meta.n_collected if meta.n_collected is not None else meta.n_videos
+    source = (f"検索語「{meta.genre}」で再生数上位の Shorts" if meta.collection_route == "search"
+              else f"「{meta.genre}」の主要チャンネルが投稿した Shorts のうち再生数上位")
+    L.append(f"{source}を {meta.n_requested} 本を目標に収集し、{collected} 本を集めた。"
+             + (f"字幕が日本語以外だった {meta.n_lang_excluded} 本を除き、" if meta.n_lang_excluded else "")
+             + f"{meta.n_videos} 本を分析した。うち字幕（発話テキスト）が取れたのは {meta.n_with_transcript} 本。")
     L.append(f"字幕とメタデータから、冒頭{int(r.opening_window_sec)}秒の入り方・結論の位置・問いかけ・CTA・話題転換・尺を取り出し、"
              "似た構成の動画をまとめて「フォーマット」として名前を付けた。")
     L.append("数値は四分位範囲（該当動画の中央 50% が収まる幅）で示す。位置の区分は 前半（0〜33%）／中盤（34〜66%）／後半（67〜100%）。")
     L.append("再生数の予測はしていない。今この検索語で上位にある動画の構成を、そのまま記述したもの。")
-    if meta.partial:
+    if meta.partial and not meta.credits_exhausted:
         L.append("")
         L.append("> **注意**: API の1日あたりの上限に達したため、収集途中のデータで作成している。翌日再実行すると本数が増える。")
+    if meta.credits_exhausted:
+        L.append("")
+        L.append("> **注意**: 字幕取得 API の今月のクレジット上限に達したため、字幕の取得を途中で止めた。翌月の再実行で本数が増える。")
     if meta.transcripts_aborted or meta.transcripts_capped:
         L.append("")
         why = "取得元から接続を制限された" if meta.transcripts_aborted else "1回あたりの取得本数の上限に達した"
@@ -182,6 +194,8 @@ def render_report(meta: ReportMeta, feats: list[Features], clusters: list[Format
     L.append("## 取得条件と制約")
     L.append("")
     L.append(f"- 字幕取得手段: `{meta.transcript_backend}`")
+    if meta.n_lang_excluded:
+        L.append(f"- 言語フィルタ: 字幕の主な言語が `{meta.transcript_lang}` 以外の {meta.n_lang_excluded} 本を分析対象から除外")
     if meta.naming_model:
         src = "LLM" if any(c.naming_source == "llm" for c in clusters) else "ルールベース"
         L.append(f"- フォーマット命名: {src}" + (f"（{meta.naming_model}）" if src == "LLM" else ""))

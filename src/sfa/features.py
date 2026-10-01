@@ -9,6 +9,12 @@ They come from config/rules.yaml (private) or config/rules.example.yaml via
 :mod:`sfa.rules`, so the framework can be public while the judgement rules
 stay with the operator.
 
+Brand / product names are matched against the TITLE, not the transcript:
+auto-generated captions mangle katakana proper nouns (observed: ポンデポテイト,
+じゃじゃらポテト, 相引きにグ), so a keyword list cannot hit them in ASR text.
+Titles are typed by the uploader and keep the names intact. Every other
+feature still comes from the transcript.
+
 Features
   opening_type        first-N-second utterance type
   topic_shifts        count + relative timings of lexical topic changes
@@ -30,6 +36,13 @@ from .transcript import Transcript
 from .youtube import Video
 
 POSITIONS = ["前半", "中盤", "後半"]  # 0-33% / 34-66% / 67-100%
+PRODUCT_TYPE = "商品名"  # opening type whose evidence comes from the title
+_RE_HASHTAG = re.compile(r"[#＃]\S+")
+
+
+def title_for_matching(title: str) -> str:
+    """Title without hashtags (#shorts, #料理 ...), which would otherwise match every rule."""
+    return _RE_HASHTAG.sub(" ", title or "").strip()
 
 _DEFAULT_RULES: Rules | None = None
 
@@ -65,14 +78,21 @@ def position_label(rel: float | None) -> str:
     return POSITIONS[0] if pct <= 33 else POSITIONS[1] if pct <= 66 else POSITIONS[2]
 
 
-def classify_opening(text: str, rules: Rules | None = None) -> str:
-    """Classify the opening utterance. Evaluated in ``rules.opening_order``; first match wins."""
+def classify_opening(text: str, rules: Rules | None = None, *, title: str | None = None) -> str:
+    """Classify the opening utterance. Evaluated in ``rules.opening_order``; first match wins.
+
+    The 商品名 rule is tested against ``title`` (hashtags removed) when a title
+    is given, because brand names do not survive ASR. Without a title (direct
+    calls, older callers) it falls back to the opening text.
+    """
     r = rules or get_rules()
     t = text.strip()
     if not t:
         return OTHER
+    product_src = title_for_matching(title) if title is not None else t
     for name in r.opening_order:
-        if r.opening_patterns[name].search(t):
+        src = product_src if name == PRODUCT_TYPE else t
+        if src and r.opening_patterns[name].search(src):
             return name
     if r.opening_fallback_conclusion and r.opening_fallback_conclusion.search(t):
         return "結論先出し" if "結論先出し" in r.opening_patterns else OTHER
@@ -192,7 +212,7 @@ def extract_features(video: Video, tr: Transcript | None, rules: Rules | None = 
     return Features(
         video_id=video.video_id, title=video.title, url=video.url, duration_sec=video.duration_sec,
         view_count=video.view_count, has_transcript=True,
-        opening_type=classify_opening(opening, r), opening_text=opening[:80],
+        opening_type=classify_opening(opening, r, title=video.title), opening_text=opening[:80],
         n_topic_shifts=len(shifts), topic_shift_positions=shifts,
         conclusion_pos=position_label(c_rel), conclusion_rel=c_rel,
         question_pos=position_label(q_rel), question_rel=q_rel,

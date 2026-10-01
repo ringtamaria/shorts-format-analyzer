@@ -1,0 +1,21 @@
+# チャンネル起点の収集経路（playlistItems.list）で使うチャンネルの一覧。
+#
+# 実運用では config/channels.yaml にコピーして書く。channels.yaml は .gitignore 済み。
+# channels.yaml がない、または該当ジャンルの記載がない場合は、従来の search.list 経路で収集する。
+#
+# 書式
+#   genres:
+#     <build_report.py --genre に渡す文字列と完全一致させる>:
+#       - id: <チャンネルID。UC で始まる 24 文字>
+#         name: <メモ用の表示名。判定には使わない>
+#
+# チャンネルID はチャンネルページの「共有 → チャンネル ID をコピー」で取れる。
+# @ハンドル や URL ではなく ID を書くこと。
+#
+# コスト: チャンネル 1 件あたり channels.list 1 ユニット（50 件ずつまとめて）＋
+#         playlistItems.list 1 ユニット/50 本。search.list（100 ユニット）は使わない。
+
+genres:
+  "ジャンル名をここに":
+    - id: UCxxxxxxxxxxxxxxxxxxxxxx
+      name: チャンネル名（メモ）

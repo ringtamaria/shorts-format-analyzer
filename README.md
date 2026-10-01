@@ -11,15 +11,31 @@ YouTube Shorts の市場動画を収集し、伸びている動画に共通す�
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # YOUTUBE_API_KEY を記入
+cp .env.example .env   # YOUTUBE_API_KEY と SUPADATA_API_KEY を記入
 
 # Phase A: ジャンルごとに字幕保有率を調べて GO / CAUTION / NG を出す
 python scripts/check_captions.py --genres "レシピ 料理" "コスメ" --sample 20
 
 # Phase B: 1ジャンル分のレポートを end-to-end で生成
-python scripts/build_report.py --genre "レシピ 料理" --n 100
+python scripts/build_report.py --genre "レシピ 料理" --n 50
 # -> out/report_<genre>_<YYYY-MM-DD>.md
+
+# 期間で区切る（月ごとに出せばトレンドの推移になる）
+python scripts/build_report.py --genre "レシピ 料理" --n 50 \
+  --published-after 2026-09-01T00:00:00Z --published-before 2026-10-01T00:00:00Z
 ```
+
+### 収集経路
+
+| 経路 | 使う条件 | コスト |
+|---|---|---|
+| チャンネル起点 | `config/channels.yaml` にそのジャンルのチャンネルがある | `channels.list` 1 ユニット/50 チャンネル ＋ `playlistItems.list` 1 ユニット/50 本 |
+| 検索 | `channels.yaml` がない、またはジャンルの記載がない | `search.list` 100 ユニット/50 本 |
+
+`search.list` は「再生数順 × ショートのみ」の条件だと 50 本前後で打ち切られることがある（2026-10-01 に確認）。
+チャンネル起点は 1/100 のコストで、「今そのチャンネルが何を出しているか」が見える。
+`config/channels.yaml` は `.gitignore` 済み。書式は `config/channels.example.yaml` を参照。
+`--reuse-search` を付けると、1 時間を過ぎた検索結果のキャッシュも再利用し、前回と同じ動画の集合で作り直せる。
 
 どちらのコマンドも実行前後に **クォータ残量** を表示する。
 上限に近づくと例外ではなく **正常終了** し、残量とリセット時刻、再開方法を表示する。
@@ -35,6 +51,24 @@ python scripts/build_report.py --genre "レシピ 料理" --n 100
 | 動画本体のダウンロード | YouTube 利用規約で原則禁止。`yt-dlp` 等は使わない |
 | TikTok / Instagram のスクレイピング | 公開 API が実質存在せず規約違反 |
 | `captions.download` の実装 | 動画の所有者しか使えない（他人の動画は 403）。スコープを広げても回避不可 |
+| 住宅プロキシなどでのブロック回避 | ブロックを自前で回避する実装は持たない |
+| 字幕がない動画の AI 文字起こし | 字幕 API の `mode` は `native` に固定。動画の音声を処理することになり、クレジットも大きく消費する |
+
+## 規約上の位置づけ
+
+字幕の取得をホスト型 API（Supadata）に移したことで、何が変わり、何が変わらないかを分けて書く。
+
+**解消すること**
+
+- 自分の IP から YouTube に字幕を取りに行かなくなる。自宅 IP のブロックと、会社の IP を使ってしまうリスクがなくなる。
+- ブロックを避けるための仕組み（プロキシ、取得間隔の調整など）を自分で持たなくてよくなる。
+
+**解消しないこと**
+
+- 字幕データの最終的な出所は YouTube のまま。ホスト型 API も裏では YouTube から取得しており、取得の主体が業者に移るだけ。
+- そのため、YouTube の利用規約に対する位置づけは、実務上のリスクと自分の能動性が下がるだけで、グレーであることは変わらない。
+
+この節を「正規の手段で取得している」と読める書き方に変えないこと。メタデータ（タイトル、尺、再生数）は YouTube Data API の正規の利用。
 
 ## 規約とクォータの制約
 
@@ -48,6 +82,8 @@ python scripts/build_report.py --genre "レシピ 料理" --n 100
 | `search.list` | **100** / 回（最大 50 件） | 最も高い。新しい video_id が必要なときだけ呼ぶ |
 | `videos.list` | 1 / 回（最大 50 件） | 既知の ID があるなら必ずこちら |
 | `captions.list` | **50** / 本 | 高い。Phase A のサンプル調査のみ |
+| `channels.list` | 1 / 回（最大 50 件） | チャンネル起点の経路で、投稿一覧のプレイリスト ID を引く |
+| `playlistItems.list` | 1 / 回（最大 50 件） | チャンネル起点の経路で、投稿動画の ID を引く |
 
 使用量は `data/quota.json` に永続記録し、`YOUTUBE_DAILY_QUOTA - YOUTUBE_QUOTA_SAFETY_MARGIN` を
 超えそうな呼び出しは行わずに正常終了する。更新はファイルロック（`flock`）で排他しており、
@@ -57,15 +93,27 @@ python scripts/build_report.py --genre "レシピ 料理" --n 100
 
 字幕テキストの取得は `sfa.transcript.get_transcript(video_id)` の裏に隠してあり、`.env` で切り替える。
 
-- `local` … `youtube-transcript-api` を使う **検証用**。YouTube の規約上グレーなので
-  **自宅など住宅用 IP から低頻度でのみ** 使う。リクエスト間隔（既定 4 秒）とリトライを入れてある。
+- `hosted`（既定）… Supadata のホスト型 API。`mode=native`（既存の字幕だけを取る、1 本 1 クレジット）に
+  **コードで固定**しており、設定では変えられない。`auto` / `generate` は字幕がない動画で AI 文字起こしに切り替わり、
+  1 分あたり 2 クレジットかかるため使わない。時刻はミリ秒で返るので秒に変換している。
+  長い動画でジョブ ID が返った場合はポーリングし、終わらなければその動画を「一時エラー」として記録して次回に回す。
+  クレジット消費は `data/supadata_credits.json` に月単位で記録し、`SUPADATA_MONTHLY_CREDITS`（既定 100）に
+  達したら正常終了する。字幕がないと分かっている動画（`captions.list` が空、または過去に字幕なしと判明）と、
+  キャッシュ済みの動画には問い合わせない。
+  `contentDetails.caption` は投稿者がアップロードした字幕だけを示し、自動生成字幕があっても false になるので、除外には使わない。
+- `local` … `youtube-transcript-api` を使う **検証用**。既定からは外した。YouTube の規約上グレーなので
+  **自宅など住宅用 IP から低頻度でのみ** 使う。リクエスト間隔（既定 30 秒）とリトライを入れてある。
   **データセンター IP（クラウド、VPN、社内プロキシ）からは `IpBlocked` になる。**
   **自宅の IP でも、頻度が高いとブロックされる。** 2026-10-01 の初回実行では、4 秒間隔で約 17 本取得した時点でブロックされた。
   既定は 30 秒間隔、1 回の実行で新規に取るのは 15 本まで（`--max-transcripts`）。取得済みはキャッシュされるので、
   1 ジャンルを数日に分けて取りきる運用にする。ブロックされたらその日は止め、翌日 1 本だけで解除を確かめてから再開する。
   プロキシ経由での回避はしない（ブロック回避にあたるため）。
-- `hosted` … 商用向けの有料ホスト型 API。**未実装のスタブ**。インターフェースだけ通してある。
 - `null` … 字幕を取らない。メタデータのみで特徴量を出すフォールバック。
+
+字幕の主な言語が `TRANSCRIPT_LANG`（既定 `ja`）以外の動画は分析対象から外し、除外した本数をレポートに書く。
+
+商品名・ブランド名の判定だけは、字幕ではなく **タイトル**（ハッシュタグを除く）を見る。
+自動生成字幕はカタカナの固有名詞を崩す（例: 「ポンデポテイト」「相引きにグ」）ため、キーワード照合が当たらない。
 
 字幕が 1 本も取れないジャンルでも、クラッシュせずその旨をレポートに書いて終了する。
 取得を途中で止めた場合は、レポート冒頭に注意書きが入り、「動画側に字幕がない」と「未取得」の本数を分けて書く。
@@ -110,11 +158,13 @@ src/sfa/
   store.py        SQLite キャッシュ
   transcript/     get_transcript() の共通インターフェースと local / hosted / null 実装
   rules.py        config/ の判定ルールを読み込む
+  channels.py     config/ のチャンネル一覧を読み込む
   features.py     構成の特徴量抽出（制作者が真似できる単位）
   formats.py      クラスタリングとフォーマット命名（LLM、なければルールベース）
   report.py       Markdown レポート生成
 config/
-  rules.example.yaml  判定ルールの汎用セット（rules.yaml は git-ignore）
+  rules.example.yaml     判定ルールの汎用セット（rules.yaml は git-ignore）
+  channels.example.yaml  チャンネル起点の収集に使うチャンネル一覧の書式（channels.yaml は git-ignore）
 scripts/
   check_captions.py   Phase A
   build_report.py     end-to-end
