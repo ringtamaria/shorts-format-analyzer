@@ -162,8 +162,10 @@ def jst_month(now: datetime | None = None) -> str:
 class CreditTracker(QuotaTracker):
     """Monthly credit ledger for a paid API (Supadata), same contract as QuotaTracker.
 
-    * period = calendar month in JST (Supadata's own cycle may differ; we
-      reset on the 1st, which is never later than theirs for a free plan)
+    * period = calendar month in JST. Supadata may reset on the signup date
+      instead; this is NOT verified. On the free plan a mismatch fails safely
+      (the provider answers 402 and the run stops). On a paid plan with
+      overage billing, align this with the provider's billing date first.
     * one credit per transcript request (``reserve("transcript")``)
     * raises :class:`QuotaExhausted` when the monthly budget is used up, which
       scripts treat as a graceful stop

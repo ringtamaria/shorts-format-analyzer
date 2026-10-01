@@ -82,7 +82,8 @@ class HostedBackend:
             self._sleep(wait)
         self._last = time.time()
         url = f"{BASE}{path}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
-        req = urllib.request.Request(url, headers={"x-api-key": self.api_key, "Accept": "application/json"})
+        req = urllib.request.Request(url, headers={"x-api-key": self.api_key, "Accept": "application/json",
+                                                "User-Agent": "shorts-format-analyzer/0.1"})
         try:
             with self._open(req, timeout=self.timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
