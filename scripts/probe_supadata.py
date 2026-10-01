@@ -6,6 +6,9 @@ from YouTube's auto-generated captions) and compares:
   * does mode=native return auto-generated captions at all?
   * do segment start times match the cached ones (ms -> s conversion)?
   * does the last segment end near the video duration?
+  * is the TEXT identical to the cached YouTube ASR, character by character?
+      identical -> Supadata passes YouTube's ASR through (misrecognitions stay)
+      different -> Supadata processes it itself (quality may differ; input for the mode decision)
 Does NOT write to the transcript cache.
 
   python scripts/probe_supadata.py            # first cached ja video
@@ -14,7 +17,9 @@ Does NOT write to the transcript cache.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -25,6 +30,35 @@ from sfa.quota import CreditTracker, QuotaExhausted  # noqa: E402
 from sfa.store import Store  # noqa: E402
 from sfa.transcript import TranscriptBlocked, TranscriptUnavailable  # noqa: E402
 from sfa.transcript.hosted import HostedBackend  # noqa: E402
+
+
+def _norm(s: str) -> str:
+    """Whitespace and line breaks differ between sources; compare the characters only."""
+    return re.sub(r"\s+", "", s)
+
+
+def compare_text(supa: str, cached: str) -> None:
+    a, b = _norm(supa), _norm(cached)
+    print("\n== text comparison with cached YouTube ASR (whitespace ignored) ==")
+    if not b:
+        print("  no cached text for this video; cannot compare")
+        return
+    ratio = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    print(f"  chars: supadata={len(a)} cached={len(b)}  similarity={ratio:.3f}  identical={a == b}")
+    if a == b:
+        print("  [RESULT] IDENTICAL: native passes YouTube's ASR through. Misrecognitions are not improved.")
+        return
+    print("  [RESULT] DIFFERENT: first differences (supadata | cached):")
+    shown = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        print(f"    {op:7} 「{a[i1:i2][:20]}」 | 「{b[j1:j2][:20]}」  (near: …{a[max(0, i1 - 8):i1]})")
+        shown += 1
+        if shown >= 8:
+            break
+    if ratio > 0.95:
+        print("  mostly identical: likely the same ASR with small formatting differences")
 
 
 def main() -> int:
@@ -66,6 +100,7 @@ def main() -> int:
     for i in range(min(6, len(tr.segments))):
         c = f"{cached[i]['start']:.2f}" if i < len(cached) else "-"
         print(f"  {tr.segments[i].start:14.2f}  | {c:>12} | {tr.segments[i].text[:30]}")
+    compare_text(tr.text, " ".join(r["text"] for r in cached))
     print()
     print(credits.status_line())
     print("Check the Supadata dashboard shows exactly 1 credit used.")
