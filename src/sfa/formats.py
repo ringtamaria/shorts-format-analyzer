@@ -62,14 +62,17 @@ def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int 
                      rules: Rules | None = None) -> list[int]:
     """Return a cluster label per feature row (same order). Single cluster when too few rows."""
     n = len(feats)
-    if n < MIN_VIDEOS_FOR_CLUSTERING:
+    min_size = (rules or get_rules()).min_cluster_for_ranges
+    # Never ask for more clusters than the data can fill to the minimum size.
+    max_k = min(max_k, n // max(1, min_size))
+    if n < MIN_VIDEOS_FOR_CLUSTERING or max_k < 2:
         return [0] * n
     from sklearn.cluster import KMeans
     from sklearn.metrics import silhouette_score
     X = _standardise([f.vector(rules) for f in feats])
     if k is None:
         best_k, best_s = 2, -1.0
-        for kk in range(2, min(max_k, n // 3) + 1):
+        for kk in range(2, max_k + 1):
             labels = KMeans(n_clusters=kk, n_init=10, random_state=seed).fit_predict(X)
             if len(set(labels)) < 2:
                 continue
@@ -77,6 +80,8 @@ def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int 
             if s > best_s:
                 best_k, best_s = kk, s
         k = best_k
+    else:
+        k = max(1, min(k, n))
     return [int(x) for x in KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(X)]
 
 

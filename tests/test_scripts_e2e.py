@@ -94,3 +94,46 @@ def test_build_report_zero_budget_exits_zero(env_tmp, fake_api, capsys, monkeypa
     import build_report
     assert build_report.main(["--genre", "x", "--n", "10", "--no-llm"]) == 0
     assert "[stop]" in capsys.readouterr().out
+
+
+def test_build_report_stops_on_block_and_reports_it(env_tmp, fake_api, capsys, monkeypatch):
+    """Simulates the 2026-10-01 run: a few transcripts succeed, then the IP is blocked."""
+    from sfa.transcript import TranscriptBlocked
+    from conftest import make_transcript
+    import sfa.transcript as T
+
+    class Blocking:
+        name = "local"
+        def __init__(self):
+            self.calls = 0
+        def fetch(self, vid):
+            self.calls += 1
+            if self.calls > 3:
+                raise TranscriptBlocked("IpBlocked: test")
+            return make_transcript(vid, ["3分でできる", "まず切る", "完成です"], seg_dur=10)
+
+    backend = Blocking()
+    monkeypatch.setattr(T, "make_backend", lambda s: backend)
+    import build_report
+    monkeypatch.setattr(build_report, "make_backend", lambda s: backend)
+    monkeypatch.setenv("TRANSCRIPT_BACKEND", "local")
+    rc = build_report.main(["--genre", "レシピ 料理", "--n", "20", "--no-llm"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert backend.calls == 4  # stopped right after the first block
+    md = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "字幕の取得を途中で止めた" in md and "取得を中断したため未取得: 17 本" in md
+    # Blocked videos were not cached, so a later run can fetch them.
+    from sfa.store import Store
+    s = Store(env_tmp / "sfa.db")
+    assert s.counts()["transcripts"] == 3
+
+
+def test_build_report_without_anthropic_key_never_calls_llm(env_tmp, fake_api, capsys, monkeypatch):
+    import sfa.formats as fm
+    def boom(*a, **k):
+        raise AssertionError("LLM must not be called without ANTHROPIC_API_KEY in .env")
+    monkeypatch.setattr(fm, "llm_name_clusters", boom)
+    import build_report
+    assert build_report.main(["--genre", "レシピ 料理", "--n", "20"]) == 0
+    assert "rule-based format names" in capsys.readouterr().out

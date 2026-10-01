@@ -122,3 +122,11 @@ def test_render_report_all_paths():
     # Zero-transcript variant
     md0 = render_report(ReportMeta("g", date.today(), 10, 3, 0, "null", 0, 9700), [f for f in feats if not f.has_transcript], [], without)
     assert "字幕が1本も取得できなかった" in md0
+
+
+def test_cluster_count_respects_minimum_cluster_size():
+    from sfa.formats import cluster_features
+    feats = [f for f in _feats(8) if f.has_transcript][:15]
+    labels = cluster_features(feats)
+    assert len(set(labels)) <= 3  # 15 // 5
+    assert cluster_features(feats[:9]) == [0] * 9  # below 2 x minimum -> single cluster

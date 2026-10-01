@@ -1,16 +1,19 @@
 """Verification backend built on youtube-transcript-api.
 
 Terms-of-service grey area: use only from a residential IP, at low frequency.
-Datacenter / VPN / corporate-proxy IPs are blocked by YouTube (IpBlocked).
+Datacenter / VPN / corporate-proxy IPs are blocked by YouTube (IpBlocked), and
+a residential IP is blocked too if the request rate is too high (observed on
+2026-10-01: blocked after ~17 fetches at a 4 s interval).
 This backend enforces a minimum interval between requests and retries a few
-times with backoff on transient errors; it never retries an IP block.
+times with backoff on transient errors; it never retries an IP block and it
+does not support proxies (that would be block evasion).
 """
 from __future__ import annotations
 
 import random
 import time
 
-from . import Segment, Transcript, TranscriptUnavailable
+from . import Segment, Transcript, TranscriptBlocked, TranscriptUnavailable
 
 PREFERRED_LANGS = ["ja", "ja-JP", "en"]
 
@@ -18,7 +21,7 @@ PREFERRED_LANGS = ["ja", "ja-JP", "en"]
 class LocalBackend:
     name = "local"
 
-    def __init__(self, min_interval_sec: float = 4.0, max_retries: int = 3, languages: list[str] | None = None):
+    def __init__(self, min_interval_sec: float = 30.0, max_retries: int = 3, languages: list[str] | None = None):
         self.min_interval = min_interval_sec
         self.max_retries = max_retries
         self.languages = languages or PREFERRED_LANGS
@@ -39,7 +42,7 @@ class LocalBackend:
             raise RuntimeError("pip install youtube-transcript-api") from e
 
         if self.ip_blocked:
-            raise RuntimeError("IpBlocked earlier in this run; not retrying from this IP")
+            raise TranscriptBlocked("blocked earlier in this run; not retrying from this IP")
 
         unavailable = tuple(
             getattr(yt_err, n) for n in ("NoTranscriptFound", "TranscriptsDisabled", "VideoUnavailable",
@@ -62,8 +65,10 @@ class LocalBackend:
                 raise TranscriptUnavailable(type(e).__name__) from e
             except blocked as e:
                 self.ip_blocked = True
-                raise RuntimeError(f"{type(e).__name__}: YouTube blocked this IP. Use a residential IP.") from e
-            except TranscriptUnavailable:
+                raise TranscriptBlocked(
+                    f"{type(e).__name__}: YouTube blocked this IP. Stop for today and retry later at a lower rate."
+                ) from e
+            except (TranscriptUnavailable, TranscriptBlocked):
                 raise
             except Exception as e:  # noqa: BLE001 - transient; retry with backoff
                 last = e

@@ -29,6 +29,10 @@ class ReportMeta:
     llm_error: str | None = None
     naming_model: str | None = None
     notes: list[str] | None = None
+    transcripts_aborted: str | None = None   # set when the backend was blocked mid-run
+    transcripts_capped: bool = False         # --max-transcripts reached
+    n_transcript_unavailable: int | None = None  # video has no transcript (final)
+    n_transcript_not_fetched: int | None = None  # not fetched yet: blocked / capped / transient error
 
 
 def _pct(x: float) -> str:
@@ -111,12 +115,15 @@ def _cluster_section(c: FormatCluster) -> list[str]:
     return lines
 
 
-def _no_transcript_section(without: list[Features]) -> list[str]:
+def _no_transcript_section(without: list[Features], meta: "ReportMeta | None" = None) -> list[str]:
     if not without:
         return []
     n = len(without)
     lines = ["## 字幕が取得できなかった動画", ""]
-    lines.append(f"{n} 本は字幕が取得できなかったため、タイトルと尺のみで集計した。")
+    lines.append(f"{n} 本は字幕がないため、タイトルと尺のみで集計した。")
+    if meta is not None and meta.n_transcript_unavailable is not None and meta.n_transcript_not_fetched is not None:
+        lines.append(f"- 動画側に字幕がない: {meta.n_transcript_unavailable} 本")
+        lines.append(f"- 取得を中断したため未取得: {meta.n_transcript_not_fetched} 本（再実行で取得できる可能性がある）")
     tt = Counter(f.title_type for f in without)
     lines.append("- タイトルの型: " + "、".join(f"{k} {_pct(v / n)}" for k, v in tt.most_common()))
     lines.append(f"- 尺: {fmt_range(quartiles([f.duration_sec for f in without], 0), '秒', small=n < get_rules().min_cluster_for_ranges)}")
@@ -149,6 +156,12 @@ def render_report(meta: ReportMeta, feats: list[Features], clusters: list[Format
     if meta.partial:
         L.append("")
         L.append("> **注意**: API の1日あたりの上限に達したため、収集途中のデータで作成している。翌日再実行すると本数が増える。")
+    if meta.transcripts_aborted or meta.transcripts_capped:
+        L.append("")
+        why = "取得元から接続を制限された" if meta.transcripts_aborted else "1回あたりの取得本数の上限に達した"
+        nf = f"{meta.n_transcript_not_fetched} 本は未取得。" if meta.n_transcript_not_fetched else ""
+        L.append(f"> **注意**: 字幕の取得を途中で止めた（{why}）。{nf}"
+                 "この版はジャンルの傾向ではなく、取得できた分だけの集計。日を改めて再実行すると本数が増える。")
     if meta.n_with_transcript == 0:
         L.append("")
         L.append("> **注意**: 字幕が1本も取得できなかったため、フォーマット抽出は行えなかった。以下はタイトルと尺のみの集計。")
@@ -165,7 +178,7 @@ def render_report(meta: ReportMeta, feats: list[Features], clusters: list[Format
         L.append("")
         for c in clusters:
             L += _cluster_section(c)
-    L += _no_transcript_section(without)
+    L += _no_transcript_section(without, meta)
     L.append("## 取得条件と制約")
     L.append("")
     L.append(f"- 字幕取得手段: `{meta.transcript_backend}`")

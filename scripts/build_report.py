@@ -29,7 +29,7 @@ from sfa.formats import extract_formats  # noqa: E402
 from sfa.quota import QuotaExhausted  # noqa: E402
 from sfa.report import ReportMeta, render_report  # noqa: E402
 from sfa.store import Store  # noqa: E402
-from sfa.transcript import TranscriptService, make_backend  # noqa: E402
+from sfa.transcript import TranscriptBlocked, TranscriptService, make_backend  # noqa: E402
 from sfa.youtube import Video, YouTubeClient  # noqa: E402
 
 
@@ -80,7 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--order", default="viewCount", choices=["viewCount", "relevance", "date"])
     ap.add_argument("--published-after", default=None, help="RFC3339, e.g. 2026-06-01T00:00:00Z")
     ap.add_argument("--refresh", action="store_true", help="ignore cached search pages")
-    ap.add_argument("--max-transcripts", type=int, default=None, help="cap transcript fetches this run")
+    ap.add_argument("--max-transcripts", type=int, default=15,
+                    help="cap NEW transcript fetches this run (default 15; cached ones are free). "
+                         "Spread a genre over several days instead of raising this.")
     ap.add_argument("--no-llm", action="store_true", help="rule-based names only")
     ap.add_argument("--k", type=int, default=None, help="fixed number of clusters")
     ap.add_argument("--out", default=None, help="output path (default out/report_<genre>_<date>.md)")
@@ -106,30 +108,55 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[error] {e}")
         return 1
     transcripts = {}
-    fetched_now = 0
+    attempts_now = 0
+    aborted: str | None = None
+    capped = False
     for i, v in enumerate(shorts, 1):
-        if args.max_transcripts is not None and fetched_now >= args.max_transcripts and store.get_transcript_row(v.video_id) is None:
+        row = store.get_transcript_row(v.video_id)
+        is_final = row is not None and row["status"] in TranscriptService.FINAL_STATUSES
+        if not is_final and args.max_transcripts is not None and attempts_now >= args.max_transcripts:
+            capped = True
             continue
-        before = svc.stats["fetched"]
         try:
             tr = svc.get_transcript(v.video_id)
         except NotImplementedError as e:
             print(f"[error] {e}")
             return 1
-        except RuntimeError as e:  # IpBlocked etc.: stop fetching, keep what we have
+        except TranscriptBlocked as e:  # stop fetching for this run; nothing cached for blocked videos
+            aborted = str(e)
             print(f"[warn] transcript backend stopped: {e}")
             break
-        fetched_now += svc.stats["fetched"] - before
+        if not is_final and settings.transcript_backend != "null":
+            attempts_now += 1
         if tr is not None:
             transcripts[v.video_id] = tr
         if i % 10 == 0 or i == len(shorts):
             print(f"  {i}/{len(shorts)}  ok={len(transcripts)} stats={svc.stats}")
 
+    if capped:
+        print(f"  [info] stopped after {args.max_transcripts} new transcript fetches (--max-transcripts). "
+              "Re-run on another day to continue; fetched ones are cached.")
+
+    # Why each video has no transcript: unavailable (final) vs not fetched yet (blocked / capped / error).
+    n_unavailable = n_not_fetched = 0
+    for v in shorts:
+        if v.video_id in transcripts:
+            continue
+        row = store.get_transcript_row(v.video_id)
+        if row is not None and row["status"] == "unavailable":
+            n_unavailable += 1
+        else:
+            n_not_fetched += 1
+
     print("\n== features / formats ==")
     feats = [extract_features(v, transcripts.get(v.video_id)) for v in shorts]
     n_tr = sum(f.has_transcript for f in feats)
     print(f"  videos={len(feats)} with_transcript={n_tr}")
-    use_llm = not args.no_llm
+    # Only call the LLM with a key from .env. Never fall back to machine-wide credentials
+    # (on a work machine those may belong to the company account).
+    use_llm = not args.no_llm and bool(settings.anthropic_api_key)
+    if not args.no_llm and not settings.anthropic_api_key:
+        print("  [info] ANTHROPIC_API_KEY is not set in .env: using rule-based format names")
     clusters, without, llm_error = extract_formats(
         feats, genre=args.genre, llm_model=settings.llm_model, anthropic_api_key=settings.anthropic_api_key or None,
         use_llm=use_llm, k=args.k,
@@ -145,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
         genre=args.genre, report_date=date.today(), n_requested=args.n, n_videos=len(feats),
         n_with_transcript=n_tr, transcript_backend=settings.transcript_backend,
         quota_used=quota.used, quota_budget=quota.budget, partial=hit_quota, llm_error=llm_error,
+        transcripts_aborted=aborted, transcripts_capped=capped,
+        n_transcript_unavailable=n_unavailable, n_transcript_not_fetched=n_not_fetched,
         naming_model=settings.llm_model if use_llm else None,
         notes=[f"検索条件: order={args.order}" + (f", publishedAfter={args.published_after}" if args.published_after else "")],
     )

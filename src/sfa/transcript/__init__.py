@@ -61,6 +61,14 @@ class TranscriptUnavailable(Exception):
     """The backend answered, but there is no usable transcript for this video."""
 
 
+class TranscriptBlocked(Exception):
+    """YouTube refused the request from this IP (rate limit / IP block).
+
+    Never cached: the video itself is fine, so it must be retried on a later run.
+    Callers should stop fetching for the rest of the run.
+    """
+
+
 class TranscriptBackend(Protocol):
     name: str
 
@@ -86,11 +94,14 @@ class TranscriptService:
     def __init__(self, backend: TranscriptBackend, store: Store):
         self.backend = backend
         self.store = store
-        self.stats = {"cache_hit": 0, "fetched": 0, "unavailable": 0, "error": 0}
+        self.stats = {"cache_hit": 0, "fetched": 0, "unavailable": 0, "error": 0, "blocked": 0}
+
+    # Cached statuses that are final. "error" rows (transient failures) are retried.
+    FINAL_STATUSES = ("ok", "unavailable")
 
     def get_transcript(self, video_id: str) -> Transcript | None:
         row = self.store.get_transcript_row(video_id)
-        if row is not None:
+        if row is not None and row["status"] in self.FINAL_STATUSES:
             self.stats["cache_hit"] += 1
             if row["status"] == "ok" and row["segments"]:
                 return Transcript.from_rows(video_id, row["language"] or "", json.loads(row["segments"]), row["backend"])
@@ -99,6 +110,9 @@ class TranscriptService:
             return None
         try:
             tr = self.backend.fetch(video_id)
+        except TranscriptBlocked:
+            self.stats["blocked"] += 1
+            raise  # not cached; caller stops this run
         except TranscriptUnavailable as e:
             self.stats["unavailable"] += 1
             self.store.put_transcript(video_id, self.backend.name, "unavailable", error=str(e))
@@ -114,5 +128,5 @@ class TranscriptService:
         return tr
 
 
-__all__ = ["Segment", "Transcript", "TranscriptUnavailable", "TranscriptBackend",
+__all__ = ["Segment", "Transcript", "TranscriptUnavailable", "TranscriptBlocked", "TranscriptBackend",
            "TranscriptService", "make_backend"]
