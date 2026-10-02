@@ -64,3 +64,21 @@ def recipe_rules():
     set_rules(r)
     yield r
     set_rules(None)
+
+
+@pytest.fixture(autouse=True)
+def isolate_private_config(tmp_path, monkeypatch):
+    """Tests must not depend on the operator's private files or live keys.
+
+    config/rules.yaml and config/channels.yaml are written by the operator
+    (genre "レシピ 料理" included), and .env holds a live Supadata key.
+    """
+    from sfa import rules as R
+    from sfa.features import set_rules
+    monkeypatch.setattr(R, "RULES_PATH", tmp_path / "no-private-rules.yaml")
+    monkeypatch.setenv("SFA_CHANNELS_PATH", str(tmp_path / "no-private-channels.yaml"))
+    monkeypatch.setenv("SUPADATA_CREDITS_PATH", str(tmp_path / "supadata_credits.json"))
+    monkeypatch.setenv("SUPADATA_API_KEY", "")
+    set_rules(None)
+    yield
+    set_rules(None)
