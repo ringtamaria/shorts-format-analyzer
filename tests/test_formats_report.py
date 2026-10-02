@@ -2,131 +2,114 @@ from datetime import date
 
 from conftest import make_transcript, make_video
 from sfa.features import extract_features
-from sfa.formats import extract_formats, fmt_position, fmt_range, profile_cluster, quartiles, rule_based_name
-from sfa.report import ReportMeta, render_report
+from sfa.formats import (classify_formats, common_phrases, discover_unclassified, fmt_position, fmt_range,
+                         profile_group, quartiles)
+from sfa.report import ASR_NOTE, ReportMeta, render_discovery, render_report
+from sfa.transcript import Segment, Transcript
 
-QUESTION_OPEN = ["知ってました？これ実は逆です", "まず材料を切ります", "次に炒めます", "味付けします", "これで完成", "保存してね"]
-NUMBER_OPEN = ["3分で作れる卵料理", "卵を割ります", "レンジで2分", "チーズをのせる", "完成です", "フォローしてね"]
+HYPE = ["やばいレシピ紹介しますまずは大量のニンニク", "炒めます", "味付けします", "盛ります", "これで完成", "保存してね"]
+WARN = ["平日には食べないでください究極の", "大根を切ります", "煮ます", "盛ります", "完成です", "またね"]
+OTHER = ["最近食べすぎちゃったな。", "今日はこれ", "切ります", "焼きます", "盛ります", "以上"]
 
 
-def _feats(n_each: int = 6):
-    feats = []
-    i = 0
-    for texts, dur in ((QUESTION_OPEN, 30), (NUMBER_OPEN, 45)):
-        for _ in range(n_each):
+def _feats(rules, n_hype=6, n_warn=3, n_other=6, n_silent=2, n_music=1, n_en=1):
+    feats, i = [], 0
+    for texts, dur, n in ((HYPE, 50, n_hype), (WARN, 58, n_warn), (OTHER, 40, n_other)):
+        for _ in range(n):
             i += 1
-            v = make_video(i, duration=dur + (i % 3), views=1000 * i)
-            feats.append(extract_features(v, make_transcript(v.video_id, texts, seg_dur=dur / len(texts))))
-    feats.append(extract_features(make_video(99, duration=20), None))  # no transcript
+            v = make_video(i, duration=dur + (i % 4), views=1000 * i)
+            feats.append(extract_features(v, make_transcript(v.video_id, texts, seg_dur=dur / len(texts)), rules))
+    for _ in range(n_silent):
+        i += 1
+        feats.append(extract_features(make_video(i, duration=20 + i % 3, views=500 * i), None, rules))
+    for _ in range(n_music):
+        i += 1
+        v = make_video(i, duration=22)
+        feats.append(extract_features(v, Transcript(v.video_id, "en", [Segment(0, 3, "[Music]")]), rules))
+    for _ in range(n_en):
+        i += 1
+        v = make_video(i, duration=55)
+        feats.append(extract_features(v, Transcript(v.video_id, "en", [Segment(0, 3, "They are eggs to die for, crack them now")]), rules))
     return feats
 
 
 def test_quartiles_and_formatting():
     q = quartiles([20, 22, 27, 30, 34], 0)
-    assert q["median"] == 27 and q["q1"] < q["median"] < q["q3"]
+    assert q["median"] == 27 and q["min"] == 20 and q["max"] == 34
     assert fmt_range(q, "秒") == f"{q['q1']:.0f}〜{q['q3']:.0f}秒（中央値27秒）"
     assert fmt_range(q, "秒", small=True) == "中央値27秒（参考値）"
-    assert fmt_range(None) == "なし"
-    pres = {"label": "後半", "pos": {"q1": 0.65, "median": 0.71, "q3": 0.80, "n": 5}}
-    assert fmt_position(pres) == "後半（65〜80%地点）"
-    assert fmt_position(pres, small=True) == "後半（71%地点、参考値）"
-    assert quartiles([5], 0) == {"q1": 5, "median": 5, "q3": 5, "n": 1}
-    assert fmt_range(quartiles([5, 5, 5], 0), "秒") == "5秒（全本ほぼ同値）"
-    assert fmt_position({"label": "前半", "pos": {"q1": 0.0, "median": 0.0, "q3": 0.0, "n": 3}}) == "前半（0%地点）"
+    pres = {"share": 0.41, "label": "後半", "pos": {"q1": 0.59, "median": 0.7, "q3": 0.77, "n": 7}}
+    assert fmt_position(pres) == "41%の動画にあり、尺の後半（59〜77%地点）"  # rate first
+    assert fmt_position({"share": 0.0, "label": "なし", "pos": None}) == "0%の動画にあり"
 
 
-def test_colliding_rule_names_are_disambiguated_by_duration():
-    feats = []
-    for i in range(1, 7):
-        v = make_video(i, duration=20, views=i)
-        feats.append(extract_features(v, make_transcript(v.video_id, QUESTION_OPEN, seg_dur=20 / 6)))
-    for i in range(7, 13):
-        v = make_video(i, duration=55, views=i)
-        feats.append(extract_features(v, make_transcript(v.video_id, QUESTION_OPEN, seg_dur=55 / 6)))
-    clusters, _, _ = extract_formats(feats, use_llm=False, k=2)
-    names = [c.name for c in clusters]
-    assert len(set(names)) == 2 and all("秒前後" in n for n in names)
+def test_groups_follow_rules_order_then_silent_then_unclassified(recipe_rules):
+    groups = classify_formats(_feats(recipe_rules), recipe_rules)
+    assert [g.format_id for g in groups] == ["hype_declaration", "warning", "silent", "unclassified"]
+    hype, warn, silent, un = groups
+    assert hype.name == "煽り宣言型" and hype.size == 6 and not hype.small_sample
+    assert warn.size == 3 and warn.small_sample
+    assert silent.size == 3 and silent.profile["speech_kinds"] == {"no_transcript": 2, "silent": 1}
+    assert un.size == 6
+    # English video is excluded from every group and from the share denominator
+    assert sum(g.size for g in groups) == 18 and abs(hype.share - 6 / 18) < 0.01
+    assert all(len(g.examples) <= 3 for g in groups)
 
 
-def test_profile_uses_ranges_and_flags_small_samples():
-    feats = [f for f in _feats(6) if f.has_transcript]
-    p = profile_cluster(feats)
-    assert p["n"] == 12 and p["small_sample"] is False
-    assert set(p["duration"]) == {"q1", "median", "q3", "n"}
-    assert p["conclusion"]["label"] in ("前半", "中盤", "後半")
-    assert p["conclusion"]["pos"]["q1"] <= p["conclusion"]["pos"]["median"] <= p["conclusion"]["pos"]["q3"]
-    assert p["cta"]["label"] == "後半" and p["cta"]["share"] == 1.0
-    small = profile_cluster(feats[:3])
-    assert small["small_sample"] is True
+def test_one_line_has_length_and_speaking_speed(recipe_rules):
+    hype = classify_formats(_feats(recipe_rules), recipe_rules)[0]
+    assert hype.one_line.startswith("煽り語で入って宣言し") and "尺 " in hype.one_line and "文字/秒" in hype.one_line
 
 
-def test_extract_formats_rule_based_two_groups():
-    clusters, without, err = extract_formats(_feats(), use_llm=False, k=2)
-    assert err is None and len(without) == 1
-    assert len(clusters) == 2
-    assert {next(iter(c.profile["opening_type"])) for c in clusters} == {"問いかけ", "数値提示"}
-    for c in clusters:
-        assert c.name.endswith("型") and c.naming_source == "rule"
-        assert 3 <= len(c.recipe) <= 8 and len(c.examples) == 3
-        assert all(e["url"].startswith("https://www.youtube.com/shorts/") for e in c.examples)
-        assert "〜" in c.one_line  # range, not a point
+def test_recipe_drops_lines_where_every_video_is_identical(recipe_rules):
+    feats = _feats(recipe_rules, n_hype=6)
+    for f in feats:
+        f.duration_sec = 50  # identical length
+    hype = classify_formats(feats, recipe_rules)[0]
+    assert not any(step.startswith("尺:") for step in hype.recipe)
+    assert any(step.startswith("完成の提示: 100%の動画にあり") for step in hype.recipe)
+    assert any(step.startswith("大量投入: 100%") for step in hype.recipe)
+    assert not any("話題転換" in step for step in hype.recipe)
 
 
-def test_extract_formats_llm_failure_falls_back(monkeypatch):
-    import sfa.formats as fm
-    def boom(*a, **k):
-        raise RuntimeError("no network")
-    monkeypatch.setattr(fm, "llm_name_clusters", boom)
-    clusters, _, err = extract_formats(_feats(), use_llm=True, llm_model="claude-sonnet-5", k=2)
-    assert "no network" in err and all(c.naming_source == "rule" for c in clusters)
+def test_profile_has_no_topic_shift_axis(recipe_rules):
+    p = profile_group([f for f in _feats(recipe_rules) if f.speech == "speech"], recipe_rules)
+    assert not any("topic" in k for k in p)
 
 
-def test_extract_formats_no_transcripts():
-    feats = [extract_features(make_video(i), None) for i in range(5)]
-    clusters, without, err = extract_formats(feats, use_llm=False)
-    assert clusters == [] and len(without) == 5
+def test_discovery_only_for_unclassified_and_only_above_threshold(recipe_rules):
+    assert discover_unclassified(_feats(recipe_rules, n_other=4), recipe_rules) is None
+    clusters = discover_unclassified(_feats(recipe_rules, n_other=6), recipe_rules)
+    assert clusters and sum(c["size"] for c in clusters) == 6
+    assert all(o["text"] for c in clusters for o in c["openings"])
+    md = render_discovery("g", date(2026, 10, 2), clusters, 6)
+    assert "納品物ではない" in md and md.count("最近食べすぎちゃったな。") == 6
 
 
-def test_rule_based_name_has_no_abstract_adjectives_and_uses_ranges():
-    feats = _feats()
-    name, one_line, recipe = rule_based_name(profile_cluster([f for f in feats if f.has_transcript]))
-    text = " ".join([name, one_line, *recipe])
-    for bad in ("インパクト", "テンポ", "魅力的", "面白い"):
-        assert bad not in text
-    assert "秒" in text and "〜" in text and "%地点" in text
+def test_common_phrases():
+    got = dict(common_phrases(["やばいレシピ紹介します", "禁断のレシピ紹介します", "今日は"]))
+    assert "レシピ紹介します" in got and got["レシピ紹介します"] == 2
 
 
-def test_small_cluster_gets_reference_note_not_ranges():
-    feats = _feats(2)  # 4 with transcripts -> single cluster of 4 (< 5)
-    clusters, without, _ = extract_formats(feats, use_llm=False)
-    assert len(clusters) == 1 and clusters[0].small_sample
-    md = render_report(ReportMeta("g", date.today(), 10, len(feats), 4, "null", 0, 9700), feats, clusters, without)
-    assert "n=4 のため傾向の参考値" in md
-    assert "参考値" in clusters[0].one_line and "〜" not in clusters[0].one_line.split("尺は")[1]
+def _meta(**kw):
+    base = dict(genre="レシピ 料理", report_date=date(2026, 10, 2), n_requested=50, n_collected=19,
+                transcript_backend="hosted", quota_used=352, quota_budget=9700, n_other_lang=1)
+    base.update(kw)
+    return ReportMeta(**base)
 
 
-def test_render_report_all_paths():
-    feats = _feats(10)  # 20 with transcripts, 10 per cluster -> "他 7 本"
-    clusters, without, _ = extract_formats(feats, use_llm=False, k=2)
-    meta = ReportMeta(genre="レシピ 料理", report_date=date(2026, 9, 26), n_requested=100, n_videos=len(feats),
-                      n_with_transcript=len(feats) - 1, transcript_backend="null", quota_used=203, quota_budget=9700,
-                      partial=True, llm_error="RuntimeError: x", naming_model="claude-sonnet-5")
-    md = render_report(meta, feats, clusters, without)
-    assert md.startswith("# YouTube Shorts 構成フォーマット分析: レシピ 料理")
-    assert "上限に達した" in md and "フォーマット 1:" in md and "字幕が取得できなかった動画" in md
-    assert "目視確認" in md
-    assert "%地点）" in md and "（Q1〜Q3 の範囲" in md
-    # URL limit: 3 per cluster + up to 3 in the no-transcript section
-    assert md.count("https://www.youtube.com/shorts/") == 3 * len(clusters) + 1
-    assert "- 他 7 本" in md
-    # Zero-transcript variant
-    md0 = render_report(ReportMeta("g", date.today(), 10, 3, 0, "null", 0, 9700), [f for f in feats if not f.has_transcript], [], without)
-    assert "字幕が1本も取得できなかった" in md0
-
-
-def test_cluster_count_respects_minimum_cluster_size():
-    from sfa.formats import cluster_features
-    feats = [f for f in _feats(8) if f.has_transcript][:15]
-    labels = cluster_features(feats)
-    assert len(set(labels)) <= 3  # 15 // 5
-    assert cluster_features(feats[:9]) == [0] * 9  # below 2 x minimum -> single cluster
+def test_render_report(recipe_rules):
+    feats = _feats(recipe_rules)
+    groups = classify_formats(feats, recipe_rules)
+    md = render_report(_meta(), feats, groups)
+    assert "## フォーマット 1: 煽り宣言型" in md and "## フォーマット 3: 無音・テロップ型" in md
+    assert "字幕が取得できなかった動画" not in md                      # no longer a 'missing data' section
+    assert "字幕が音楽・効果音の表記だけ（発話なしと確認）: 1 本" in md
+    assert "字幕がない（発話の有無は未確認）: 2 本" in md and "目視確認" in md
+    assert "## 未分類" in md and md.count("「最近食べすぎちゃったな。」") == 6  # every unclassified opening
+    assert ASR_NOTE in md
+    assert "| 完成の提示 | 100%の動画にあり、尺の" in md
+    assert "話題転換" not in md
+    assert "字幕が日本語以外だった 1 本" in md
+    assert "サムネイル" in md and "解析もしていない" in md
+    assert "掲載URLは納品前に目視確認すること" in md

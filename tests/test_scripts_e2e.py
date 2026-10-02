@@ -70,7 +70,7 @@ def test_build_report_writes_markdown_with_null_backend(env_tmp, fake_api, capsy
     reports = list((env_tmp / "out").glob("report_レシピ_料理_*.md"))
     assert len(reports) == 1
     md = reports[0].read_text()
-    assert "字幕が1本も取得できなかった" in md  # null backend => metadata-only, no crash
+    assert "字幕を1本も取得していない" in md  # null backend => no typing, no crash
     assert "YouTube Data API 使用量" in md
     feats = json.loads(reports[0].with_suffix(".features.json").read_text())
     assert len(feats["features"]) == 100
@@ -122,21 +122,24 @@ def test_build_report_stops_on_block_and_reports_it(env_tmp, fake_api, capsys, m
     assert rc == 0, out
     assert backend.calls == 4  # stopped right after the first block
     md = next((env_tmp / "out").glob("report_*.md")).read_text()
-    assert "字幕の取得を途中で止めた" in md and "取得を中断したため未取得: 17 本" in md
+    assert "字幕の取得を途中で止めた" in md and "17 本は未取得" in md and "字幕を未取得の 17 本" in md
     # Blocked videos were not cached, so a later run can fetch them.
     from sfa.store import Store
     s = Store(env_tmp / "sfa.db")
     assert s.counts()["transcripts"] == 3
 
 
-def test_build_report_without_anthropic_key_never_calls_llm(env_tmp, fake_api, capsys, monkeypatch):
-    import sfa.formats as fm
-    def boom(*a, **k):
-        raise AssertionError("LLM must not be called without ANTHROPIC_API_KEY in .env")
-    monkeypatch.setattr(fm, "llm_name_clusters", boom)
+def test_build_report_never_uses_the_anthropic_sdk(env_tmp, fake_api, monkeypatch):
+    """Format names come from rules.yaml; no LLM call, so no risk of picking up work credentials."""
+    import builtins
+    real_import = builtins.__import__
+    def guard(name, *a, **k):
+        if name == "anthropic" or name.startswith("anthropic."):
+            raise AssertionError("anthropic must not be imported")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", guard)
     import build_report
     assert build_report.main(["--genre", "レシピ 料理", "--n", "20"]) == 0
-    assert "rule-based format names" in capsys.readouterr().out
 
 
 # ---- round 3 -----------------------------------------------------------------
@@ -236,9 +239,9 @@ def test_hosted_skips_cached_and_known_no_caption_and_filters_language(env_tmp, 
     assert not asked & {"v001", "v002", "v003"}       # cached ok / known unavailable / no tracks
     assert "v004" in asked and "v005" in asked
     md = next((env_tmp / "out").glob("report_*.md")).read_text()
-    assert "日本語以外だった 1 本を除き" in md and "分析対象から除外" in md
+    assert "日本語以外だった 1 本" in md and "分析対象から除外" in md
     feats = json.loads(next((env_tmp / "out").glob("*.features.json")).read_text())
-    assert "v005" in feats["lang_excluded"] and all(f["video_id"] != "v005" for f in feats["features"])
+    assert feats["other_lang"] == ["v005"]
 
 
 def test_hosted_credit_exhaustion_is_a_graceful_partial_report(env_tmp, fake_api, capsys, monkeypatch):
@@ -251,3 +254,70 @@ def test_hosted_credit_exhaustion_is_a_graceful_partial_report(env_tmp, fake_api
     assert rc == 0 and "[stop]" in out and len(be.calls) == 3
     md = next((env_tmp / "out").glob("report_*.md")).read_text()
     assert "クレジット上限に達した" in md and "1日あたりの上限" not in md
+
+
+# ---- round 4 -----------------------------------------------------------------
+
+def test_reclassify_after_rule_change_makes_no_api_calls(env_tmp, fake_api, capsys, monkeypatch):
+    """build once (with API), then edit rules and reclassify with every network path booby-trapped."""
+    from conftest import RECIPE_RULES
+    import yaml
+    be = ScriptedBackend()
+    build_report = _use_backend(monkeypatch, be)
+    assert build_report.main(["--genre", "レシピ 料理", "--n", "20"]) == 0
+    first = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "## 未分類" in first  # example rules: "3分でできる" matches no type
+
+    # Network is now forbidden: YouTube client, Supadata, urllib.
+    def no_network(*a, **k):
+        raise AssertionError("reclassify must not touch the network")
+    monkeypatch.setattr(youtube.YouTubeClient, "_get", no_network)
+    monkeypatch.setattr("urllib.request.urlopen", no_network)
+    import sfa.transcript.hosted as H
+    monkeypatch.setattr(H.HostedBackend, "fetch", no_network)
+
+    # Operator adds a rule for the unclassified opening.
+    rules = dict(RECIPE_RULES)
+    rules["opening_types"] = [{"id": "speed", "name": "時短宣言型", "one_line": "所要時間で入る", "match": "分でできる"}]
+    p = env_tmp / "rules.yaml"
+    p.write_text(yaml.safe_dump(rules, allow_unicode=True), encoding="utf-8")
+    from sfa import rules as R
+    from sfa.features import set_rules
+    monkeypatch.setattr(R, "RULES_PATH", p)
+    set_rules(None)
+    try:
+        import reclassify
+        rc = reclassify.main(["--genre", "レシピ 料理"])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        md = next((env_tmp / "out").glob("report_*.md")).read_text()
+        assert "## フォーマット 1: 時短宣言型" in md and "## 未分類" not in md
+        assert "API は使っていない" in md
+        fj = json.loads(next((env_tmp / "out").glob("report_*.features.json")).read_text())
+        assert len(fj["video_ids"]) == 20
+    finally:
+        set_rules(None)
+
+
+def test_discovery_file_is_separate_from_the_report(env_tmp, fake_api, capsys, monkeypatch):
+    be = ScriptedBackend()
+    build_report = _use_backend(monkeypatch, be)
+    assert build_report.main(["--genre", "レシピ 料理", "--n", "20"]) == 0
+    disc = list((env_tmp / "out").glob("unclassified_*.md"))
+    assert len(disc) == 1 and "納品物ではない" in disc[0].read_text()
+    md = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "候補 1" not in md
+
+
+def test_phase_a_zero_sample_gives_no_verdict(env_tmp, fake_api, capsys):
+    import check_captions
+    assert check_captions.main(["--genres", "レシピ 料理", "--asr-sample", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "cannot judge" in out and "| レシピ 料理 |" not in out
+    assert fake_api.calls == []  # stopped before spending quota
+
+
+def test_phase_a_default_sample_is_ten(env_tmp, fake_api, capsys):
+    import check_captions
+    assert check_captions.main(["--genres", "レシピ 料理"]) == 0
+    assert fake_api.calls.count("captions.list") == 10

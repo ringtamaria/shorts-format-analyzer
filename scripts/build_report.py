@@ -10,8 +10,9 @@ Collection routes (--source, default auto)
   search    otherwise: search.list pages (100 units each) -> videos.list.
 
 Transcripts via TRANSCRIPT_BACKEND (hosted = Supadata by default). Cached
-transcripts are never re-fetched, videos already known to have no captions
-are never queried, and non-Japanese transcripts are excluded from analysis.
+transcripts are never re-fetched and videos already known to have no captions
+are never queried. Analysis then runs from the cache only (sfa.pipeline), the
+same code path as scripts/reclassify.py.
 
 Budgets: YouTube quota (daily) and Supadata credits (monthly) both stop the
 run *normally*; a partial report is written and marked as such.
@@ -28,10 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sfa.channels import Channel, load_channels  # noqa: E402
 from sfa.cli import bootstrap, genre_slug, graceful_quota_stop  # noqa: E402
-from sfa.features import extract_features  # noqa: E402
-from sfa.formats import extract_formats  # noqa: E402
+from sfa.features import get_rules  # noqa: E402
+from sfa.pipeline import analyse, meta_from_run, write_outputs  # noqa: E402
 from sfa.quota import QuotaExhausted  # noqa: E402
-from sfa.report import ReportMeta, render_report  # noqa: E402
 from sfa.store import Store  # noqa: E402
 from sfa.transcript import TranscriptBlocked, TranscriptService, make_backend  # noqa: E402
 from sfa.youtube import Video, YouTubeClient  # noqa: E402
@@ -141,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-transcripts", type=int, default=None,
                     help=f"cap NEW transcript fetches this run (default: {LOCAL_DEFAULT_MAX_TRANSCRIPTS} for local, "
                          "no cap for hosted, which is limited by monthly credits instead)")
-    ap.add_argument("--no-llm", action="store_true", help="rule-based names only")
-    ap.add_argument("--k", type=int, default=None, help="fixed number of clusters")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="accepted for compatibility; format names now come from config/rules.yaml")
     ap.add_argument("--out", default=None, help="output path (default out/report_<genre>_<date>.md)")
     args = ap.parse_args(argv)
 
@@ -203,7 +203,6 @@ def main(argv: list[str] | None = None) -> int:
     credits_exhausted = False
     capped = False
     skipped_known_none = 0
-    lang_excluded: list[str] = []
     for i, v in enumerate(shorts, 1):
         row = store.get_transcript_row(v.video_id)
         is_final = row is not None and row["status"] in TranscriptService.FINAL_STATUSES
@@ -233,52 +232,22 @@ def main(argv: list[str] | None = None) -> int:
         if not is_final and settings.transcript_backend != "null":
             attempts_now += 1
         if tr is not None:
-            if tr.is_lang(settings.transcript_lang):
-                transcripts[v.video_id] = tr
-            else:
-                lang_excluded.append(v.video_id)
+            transcripts[v.video_id] = tr
         if i % 10 == 0 or i == len(shorts):
-            print(f"  {i}/{len(shorts)}  ok={len(transcripts)} excluded_lang={len(lang_excluded)} stats={svc.stats}")
+            print(f"  {i}/{len(shorts)}  ok={len(transcripts)} stats={svc.stats}")
     if capped:
         print(f"  [info] stopped after {max_new} new transcript fetches (--max-transcripts). "
               "Re-run later to continue; fetched ones are cached.")
     if credits is not None:
         print(credits.status_line())
 
-    # Videos whose transcript is in another language are removed from the analysis entirely.
-    excluded = set(lang_excluded)
-    analysed = [v for v in shorts if v.video_id not in excluded]
-
-    n_unavailable = n_not_fetched = 0
-    for v in analysed:
-        if v.video_id in transcripts:
-            continue
-        row = store.get_transcript_row(v.video_id)
-        if row is not None and row["status"] == "unavailable":
-            n_unavailable += 1
-        else:
-            n_not_fetched += 1
-
-    # ---- features / formats
-    print("\n== features / formats ==")
-    feats = [extract_features(v, transcripts.get(v.video_id)) for v in analysed]
-    n_tr = sum(f.has_transcript for f in feats)
-    print(f"  videos={len(feats)} with_transcript={n_tr} excluded_lang={len(lang_excluded)}")
-    # Only call the LLM with a key from .env. Never fall back to machine-wide credentials
-    # (on a work machine those may belong to the company account).
-    use_llm = not args.no_llm and bool(settings.anthropic_api_key)
-    if not args.no_llm and not settings.anthropic_api_key:
-        print("  [info] ANTHROPIC_API_KEY is not set in .env: using rule-based format names")
-    clusters, without, llm_error = extract_formats(
-        feats, genre=args.genre, llm_model=settings.llm_model, anthropic_api_key=settings.anthropic_api_key or None,
-        use_llm=use_llm, k=args.k,
-    )
-    if llm_error:
-        print(f"  [warn] LLM naming failed, using rule-based names: {llm_error}")
-    for c in clusters:
-        print(f"  {c.cluster_id + 1}. {c.name} ({c.size}, {c.naming_source})")
-    if n_tr == 0:
-        print("  no transcripts for this genre: report will contain metadata-only findings")
+    # ---- analysis: from the cache only (same path as scripts/reclassify.py)
+    print("\n== types ==")
+    rules = get_rules()
+    an = analyse(shorts, store, lang=settings.transcript_lang, rules=rules)
+    for g in an.groups:
+        print(f"  {g.name}: {g.size}")
+    print(f"  other_lang={len(an.other_lang)} not_fetched={len(an.not_fetched)} rules={rules.source}")
 
     window = ", ".join(x for x in (f"publishedAfter={args.published_after}" if args.published_after else "",
                                     f"publishedBefore={args.published_before}" if args.published_before else "") if x)
@@ -289,25 +258,19 @@ def main(argv: list[str] | None = None) -> int:
     notes = [cond + (f"、{window}" if window else "")]
     if credits is not None:
         notes.append(f"字幕取得 API のクレジット: {credits.used} / {credits.budget}（今月分）")
-    meta = ReportMeta(
-        genre=args.genre, report_date=date.today(), n_requested=args.n, n_videos=len(feats),
-        n_with_transcript=n_tr, transcript_backend=settings.transcript_backend,
-        quota_used=quota.used, quota_budget=quota.budget, partial=hit_quota or credits_exhausted,
-        credits_exhausted=credits_exhausted,
-        llm_error=llm_error, transcripts_aborted=aborted, transcripts_capped=capped,
-        n_transcript_unavailable=n_unavailable, n_transcript_not_fetched=n_not_fetched,
-        n_lang_excluded=len(lang_excluded), transcript_lang=settings.transcript_lang,
-        collection_route=route, n_collected=len(shorts),
-        naming_model=settings.llm_model if use_llm else None, notes=notes,
-    )
-    md = render_report(meta, feats, clusters, without)
+    run = {
+        "genre": args.genre, "n_requested": args.n, "transcript_backend": settings.transcript_backend,
+        "transcript_lang": settings.transcript_lang, "collection_route": route,
+        "partial": hit_quota or credits_exhausted, "credits_exhausted": credits_exhausted,
+        "transcripts_aborted": aborted, "transcripts_capped": capped, "notes": notes,
+        "skipped_known_no_captions": skipped_known_none,
+    }
+    meta = meta_from_run(run, an, quota_used=quota.used, quota_budget=quota.budget, rules=rules,
+                         report_date=date.today(), reclassified=False)
     out = Path(args.out) if args.out else settings.out_dir / f"report_{genre_slug(args.genre)}_{date.today().isoformat()}.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(md, encoding="utf-8")
-    (out.with_suffix(".features.json")).write_text(
-        json.dumps({"features": [f.to_dict() for f in feats], "clusters": [c.to_dict() for c in clusters],
-                    "lang_excluded": lang_excluded, "skipped_known_no_captions": skipped_known_none},
-                   ensure_ascii=False, indent=1), encoding="utf-8")
+    paths = write_outputs(an, meta, out, video_ids=[v.video_id for v in shorts], run_info=run)
+    if "discovery" in paths:
+        print(f"  discovery file (not for delivery): {paths['discovery']}")
     print(f"\n[done] wrote {out}")
     print(quota.status_line())
     if hit_quota:

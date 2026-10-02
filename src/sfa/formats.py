@@ -1,44 +1,48 @@
-"""Group videos into structural formats and give each one a name a client
-can act on ("冒頭3秒クローズアップ型", not "cluster 3").
+"""Group videos by the human-defined format types and profile each group.
 
-Pipeline
-  1. standardise feature vectors (only videos that have a transcript)
-  2. KMeans, k chosen by silhouette in a small range
-  3. build a numeric profile per cluster: quartile ranges (Q1-median-Q3), shares
-  4. name each cluster: LLM if available, else rule-based
-Videos without transcripts are reported separately from metadata only.
+Formats are no longer discovered by clustering. Each video was already given
+one type by :func:`sfa.features.extract_features` (rules order = priority),
+plus two built-in groups:
 
-Numbers are reported as ranges, never as a single point: with ~15 videos per
-cluster a lone median reads as a target it is not. Clusters smaller than
-``rules.min_cluster_for_ranges`` are flagged as reference-only.
+  silent        no speech (no caption track, or only [Music] / [Applause])
+  unclassified  speech that matched no rule; its opening texts are listed in
+                full in the report, as input for new rules
+
+Clustering survives only as a discovery tool over the unclassified videos
+(:func:`discover_unclassified`), written to a separate file, never to the
+delivered report.
+
+Numbers are quartile ranges, never a lone point: with ~15 videos per group a
+single median reads as a target it is not. Groups smaller than
+``rules.min_type_size`` are flagged as reference-only.
 """
 from __future__ import annotations
 
-import json
 import re
 import statistics
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .features import Features, get_rules, position_label
-from .rules import Rules
+from .rules import SILENT_ID, UNCLASSIFIED_ID, Rules
 
-MIN_VIDEOS_FOR_CLUSTERING = 6
 N_EXAMPLES = 3
 
 
 @dataclass
-class FormatCluster:
-    cluster_id: int
+class FormatGroup:
+    format_id: str
+    kind: str                      # type | silent | unclassified
     name: str
     one_line: str
-    recipe: list[str]              # concrete, copyable steps (seconds / order / structure)
+    recipe: list[str]
     size: int
-    share: float
+    share: float                   # of analysed videos
     profile: dict[str, Any]
-    examples: list[dict[str, Any]]  # top N_EXAMPLES by views: [{title, url, view_count, duration_sec}]
-    naming_source: str = "rule"     # rule | llm
+    examples: list[dict[str, Any]]  # top N_EXAMPLES by views
+    members: list[str] = field(default_factory=list)
+    order: int = 0
 
     @property
     def small_sample(self) -> bool:
@@ -48,93 +52,56 @@ class FormatCluster:
         return asdict(self)
 
 
-# ---- clustering ------------------------------------------------------------
-
-def _standardise(rows: list[list[float]]) -> list[list[float]]:
-    import numpy as np
-    X = np.asarray(rows, dtype=float)
-    mu, sd = X.mean(axis=0), X.std(axis=0)
-    sd[sd == 0] = 1.0
-    return ((X - mu) / sd).tolist()
-
-
-def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int = 6, seed: int = 0,
-                     rules: Rules | None = None) -> list[int]:
-    """Return a cluster label per feature row (same order). Single cluster when too few rows."""
-    n = len(feats)
-    min_size = (rules or get_rules()).min_cluster_for_ranges
-    # Never ask for more clusters than the data can fill to the minimum size.
-    max_k = min(max_k, n // max(1, min_size))
-    if n < MIN_VIDEOS_FOR_CLUSTERING or max_k < 2:
-        return [0] * n
-    from sklearn.cluster import KMeans
-    from sklearn.metrics import silhouette_score
-    X = _standardise([f.vector(rules) for f in feats])
-    if k is None:
-        best_k, best_s = 2, -1.0
-        for kk in range(2, max_k + 1):
-            labels = KMeans(n_clusters=kk, n_init=10, random_state=seed).fit_predict(X)
-            if len(set(labels)) < 2:
-                continue
-            s = silhouette_score(X, labels)
-            if s > best_s:
-                best_k, best_s = kk, s
-        k = best_k
-    else:
-        k = max(1, min(k, n))
-    return [int(x) for x in KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(X)]
-
-
-# ---- profiling -------------------------------------------------------------
+# ---- statistics ------------------------------------------------------------
 
 def quartiles(xs: list[float], nd: int = 2) -> dict[str, float] | None:
-    """{"q1", "median", "q3", "n"} or None when empty."""
+    """{"q1", "median", "q3", "n", "min", "max"} or None when empty."""
     xs = [float(x) for x in xs]
     if not xs:
         return None
     if len(xs) == 1:
         v = round(xs[0], nd)
-        return {"q1": v, "median": v, "q3": v, "n": 1}
+        return {"q1": v, "median": v, "q3": v, "n": 1, "min": v, "max": v}
     q1, med, q3 = statistics.quantiles(xs, n=4, method="inclusive")
-    return {"q1": round(q1, nd), "median": round(med, nd), "q3": round(q3, nd), "n": len(xs)}
+    return {"q1": round(q1, nd), "median": round(med, nd), "q3": round(q3, nd), "n": len(xs),
+            "min": round(min(xs), nd), "max": round(max(xs), nd)}
 
 
 def _share(counter: Counter, total: int) -> dict[str, float]:
     return {k: round(v / total, 2) for k, v in counter.most_common()} if total else {}
 
 
-def _presence(members: list[Features], attr: str) -> dict[str, Any]:
+def _presence(members: list[Features], attr: str, rules: Rules) -> dict[str, Any]:
     vals = [getattr(m, attr) for m in members if getattr(m, attr) is not None]
     q = quartiles(vals, 3)
     return {
         "share": round(len(vals) / len(members), 2) if members else 0.0,
         "pos": q,
-        "label": position_label(q["median"]) if q else "なし",
+        "label": position_label(q["median"], rules) if q else "なし",
     }
 
 
-def profile_cluster(members: list[Features], rules: Rules | None = None) -> dict[str, Any]:
+def profile_group(members: list[Features], rules: Rules | None = None) -> dict[str, Any]:
     r = rules or get_rules()
     n = len(members)
+    spoken = [m for m in members if m.speech == "speech"]
     return {
         "n": n,
-        "small_sample": n < r.min_cluster_for_ranges,
+        "n_spoken": len(spoken),
+        "small_sample": n < r.min_type_size,
         "duration": quartiles([m.duration_sec for m in members], 0),
-        "speech_density": quartiles([m.speech_density for m in members], 1),
-        "topic_shifts": quartiles([m.n_topic_shifts for m in members], 0),
-        "opening_type": _share(Counter(m.opening_type for m in members), n),
-        "opening_examples": list(dict.fromkeys(m.opening_text for m in members if m.opening_text))[:5],
-        "conclusion_pos": _share(Counter(m.conclusion_pos for m in members), n),
-        "conclusion": _presence(members, "conclusion_rel"),
-        "question": _presence(members, "question_rel"),
-        "cta": _presence(members, "cta_rel"),
+        "speech_density": quartiles([m.speech_density for m in spoken], 1),
+        "opening_examples": list(dict.fromkeys(m.opening_text for m in spoken if m.opening_text))[:5],
+        "completion": _presence(spoken, "completion_rel", r),
+        "question": _presence(spoken, "question_rel", r),
+        "cta": _presence(spoken, "cta_rel", r),
+        "bulk_input_share": round(sum(m.bulk_input for m in spoken) / len(spoken), 2) if spoken else 0.0,
+        "brand_share": round(sum(m.brand is not None for m in members) / n, 2) if n else 0.0,
+        "brands": dict(Counter(m.brand for m in members if m.brand).most_common()),
         "title_type": _share(Counter(m.title_type for m in members), n),
+        "speech_kinds": dict(Counter(m.speech for m in members)),
         "view_median": quartiles([m.view_count for m in members], 0),
     }
-
-
-def _dominant(share: dict[str, float]) -> str:
-    return next(iter(share), "その他") if share else "その他"
 
 
 # ---- text helpers shared with report.py ------------------------------------
@@ -152,157 +119,168 @@ def fmt_range(q: dict[str, float] | None, unit: str = "", *, small: bool = False
 
 
 def fmt_position(p: dict[str, Any], *, small: bool = False) -> str:
-    """'後半（65〜80%地点）' from a presence dict; '' when absent."""
+    """Rate FIRST, then where: '41%の動画にあり、尺の後半（59〜77%地点）'."""
+    rate = f"{int(round(p['share'] * 100))}%の動画にあり"
     q = p.get("pos")
     if not q:
-        return "なし"
+        return rate
     pct = lambda x: f"{int(round(x * 100))}"  # noqa: E731
     if small:
-        return f"{p['label']}（{pct(q['median'])}%地点、参考値）"
-    if pct(q["q1"]) == pct(q["q3"]):
-        return f"{p['label']}（{pct(q['median'])}%地点）"
-    return f"{p['label']}（{pct(q['q1'])}〜{pct(q['q3'])}%地点）"
+        where = f"{p['label']}（{pct(q['median'])}%地点、参考値）"
+    elif pct(q["q1"]) == pct(q["q3"]):
+        where = f"{p['label']}（{pct(q['median'])}%地点）"
+    else:
+        where = f"{p['label']}（{pct(q['q1'])}〜{pct(q['q3'])}%地点）"
+    return f"{rate}、尺の{where}"
 
 
-def rule_based_name(p: dict[str, Any], rules: Rules | None = None) -> tuple[str, str, list[str]]:
-    """Fallback naming from the profile alone. Concrete, ranges, no adjectives."""
-    r = rules or get_rules()
+def _all_same(q: dict[str, float] | None) -> bool:
+    return q is None or q.get("min") == q.get("max")
+
+
+def group_one_line(base: str, p: dict[str, Any]) -> str:
+    """Rule one-liner + the two numbers a creator can act on: length and speaking speed."""
     small = bool(p.get("small_sample"))
-    opening = _dominant(p["opening_type"])
-    concl_label = p["conclusion"]["label"]
-    dur = p["duration"]
-    name = f"冒頭{opening}・結論{concl_label}型" if concl_label != "なし" else f"冒頭{opening}・展開型"
-    one_line = (f"0〜{int(r.opening_window_sec)}秒で{opening}、結論は{fmt_position(p['conclusion'], small=small)}、"
-                f"尺は{fmt_range(dur, '秒', small=small)}")
-    ex = p["opening_examples"][0] if p["opening_examples"] else None
-    recipe = [f"0〜{int(r.opening_window_sec)}秒: {opening}で入る" + (f"（例: {ex}）" if ex else "")]
-    if p["conclusion"]["pos"]:
-        recipe.append(f"結論・完成の提示: 尺の{fmt_position(p['conclusion'], small=small)}")
-    for key, label in (("question", "問いかけ"), ("cta", "CTA")):
-        if p[key]["share"] >= r.presence_share and p[key]["pos"]:
-            recipe.append(f"{label}: {int(p[key]['share'] * 100)}%の動画にあり、尺の{fmt_position(p[key], small=small)}")
-    recipe.append(f"話題転換: {fmt_range(p['topic_shifts'], '回', small=small)}、"
-                  f"発話密度: {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)}")
-    recipe.append(f"尺: {fmt_range(dur, '秒', small=small)}")
-    recipe.append(f"タイトル: {_dominant(p['title_type'])}が最多")
-    return name, one_line, recipe
+    bits = [base] if base else []
+    if p["duration"]:
+        bits.append(f"尺 {fmt_range(p['duration'], '秒', small=small)}")
+    if p["speech_density"]:
+        bits.append(f"発話 {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)}")
+    return "。".join(bits)
 
 
-# ---- LLM naming ------------------------------------------------------------
-
-LLM_SYSTEM = """あなたはショート動画の構成分析を、企業のSNS担当者向けレポートにまとめる編集者です。
-与えられるのは、YouTube Shorts をクラスタリングした各グループの数値プロファイルです。
-各グループに、制作者がそのまま真似できる「◯◯型」という名前を付け、構成レシピを書いてください。
-
-厳守事項:
-- 名前は「冒頭3秒クローズアップ型」「Before/After反転型」「数値訴求型」のような粒度の日本語。末尾は「型」。
-- 抽象的な形容詞（インパクトのある、テンポの良い、魅力的、面白い 等）は禁止。秒数・語順・構造で書く。
-- 数値は必ず範囲で書く。プロファイルの q1〜q3 を「20〜34秒」「尺の65〜80%地点」の形で使い、中央値を単独の目標値として書かない。
-- 位置は 前半（0〜33%）／中盤（34〜66%）／後半（67〜100%）の区分名に範囲を添える。例: 「後半（65〜80%地点）」
-- small_sample が true のグループは、範囲を出さず「n=◯ のため傾向の参考値」と one_line の冒頭に書く。
-- recipe は 3〜6 行。各行は「0〜3秒: 〜」「尺の40〜55%地点で〜」のように、時間か順序を含む。
-- プロファイルにない事実を作らない。数値はプロファイルの値をそのまま使う。
-- 出力は JSON のみ。説明文やコードフェンスを付けない。
-
-出力形式:
-{"clusters": [{"cluster_id": 0, "name": "…型", "one_line": "…", "recipe": ["…", "…"]}, …]}
-"""
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
-
-
-def llm_name_clusters(profiles: list[dict[str, Any]], *, model: str, api_key: str | None = None,
-                      genre: str = "") -> dict[int, tuple[str, str, list[str]]]:
-    """Ask Claude to name the clusters. Raises on failure; callers fall back."""
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=api_key or None)
-    payload = json.dumps({"genre": genre, "clusters": profiles}, ensure_ascii=False, indent=1)
-    kwargs: dict[str, Any] = dict(
-        model=model,
-        max_tokens=8000,
-        system=LLM_SYSTEM,
-        messages=[{"role": "user", "content": f"以下のクラスタに名前とレシピを付けてください。\n\n{payload}"}],
-    )
-    try:
-        # Server-side refusal fallback: if the safety layer declines, the API re-runs on a fallback model.
-        resp = client.beta.messages.create(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs)
-    except (anthropic.BadRequestError, TypeError):
-        resp = client.messages.create(**kwargs)
-    if resp.stop_reason == "refusal":
-        raise RuntimeError("LLM refused the naming request")
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    data = _extract_json(text)
-    out: dict[int, tuple[str, str, list[str]]] = {}
-    for c in data.get("clusters", []):
-        cid = int(c["cluster_id"])
-        name = str(c.get("name", "")).strip()
-        if not name:
-            continue
-        out[cid] = (name, str(c.get("one_line", "")).strip(), [str(r) for r in c.get("recipe", [])])
+def group_recipe(p: dict[str, Any], rules: Rules, *, opening_line: str | None) -> list[str]:
+    """Steps a creator can follow. Lines with no information (every video identical) are dropped."""
+    small = bool(p.get("small_sample"))
+    out: list[str] = []
+    if opening_line:
+        ex = p["opening_examples"][0] if p["opening_examples"] else None
+        out.append(f"0〜{int(rules.opening_window_sec)}秒: {opening_line}" + (f"（例: 「{ex}」）" if ex else ""))
+    for key, label in (("completion", "完成の提示"), ("question", "問いかけ"), ("cta", "CTA")):
+        pr = p[key]
+        if pr["share"] >= rules.presence_share and pr["pos"]:
+            out.append(f"{label}: {fmt_position(pr, small=small)}")
+    if p["bulk_input_share"] >= rules.presence_share:
+        out.append(f"大量投入: {int(p['bulk_input_share'] * 100)}%の動画にあり")
+    if p["speech_density"] and not _all_same(p["speech_density"]):
+        out.append(f"発話密度: {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)}")
+    if p["duration"] and not _all_same(p["duration"]):
+        out.append(f"尺: {fmt_range(p['duration'], '秒', small=small)}")
+    if p["title_type"] and len(p["title_type"]) > 0:
+        top, share = next(iter(p["title_type"].items()))
+        out.append(f"タイトル: {top}が{int(share * 100)}%")
     return out
 
 
-# ---- entry point -----------------------------------------------------------
+# ---- grouping ----------------------------------------------------------------
 
-def extract_formats(feats: list[Features], *, genre: str = "", llm_model: str | None = None,
-                    anthropic_api_key: str | None = None, use_llm: bool = True,
-                    k: int | None = None, rules: Rules | None = None
-                    ) -> tuple[list[FormatCluster], list[Features], str | None]:
-    """Returns (clusters, videos_without_transcript, llm_error_or_None)."""
+def classify_formats(feats: list[Features], rules: Rules | None = None) -> list[FormatGroup]:
+    """Groups in rules order, then the silent type, then unclassified. Empty groups are omitted."""
     r = rules or get_rules()
-    with_tr = [f for f in feats if f.has_transcript]
-    without = [f for f in feats if not f.has_transcript]
-    if not with_tr:
-        return [], without, None
-
-    labels = cluster_features(with_tr, k=k, rules=r)
-    groups: dict[int, list[Features]] = {}
-    for f, lab in zip(with_tr, labels):
-        groups.setdefault(lab, []).append(f)
-    ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # largest first
-    profiles: list[dict[str, Any]] = []
-    for new_id, (_, members) in enumerate(ordered):
-        p = profile_cluster(members, r)
-        p["cluster_id"] = new_id
-        profiles.append(p)
-
-    names: dict[int, tuple[str, str, list[str]]] = {}
-    llm_error: str | None = None
-    if use_llm and llm_model:
-        try:
-            names = llm_name_clusters(profiles, model=llm_model, api_key=anthropic_api_key, genre=genre)
-        except Exception as e:  # noqa: BLE001 - never block the report on the LLM
-            llm_error = f"{type(e).__name__}: {e}"
-
-    clusters: list[FormatCluster] = []
-    total = len(with_tr)
-    resolved: list[tuple[str, str, list[str], str]] = []
-    for new_id in range(len(ordered)):
-        p = profiles[new_id]
-        if new_id in names:
-            resolved.append((*names[new_id], "llm"))
+    analysed = [f for f in feats if f.speech in ("speech", "silent", "no_transcript")]
+    total = len(analysed)
+    order = [(t.id, "type") for t in r.opening_types] + [(SILENT_ID, "silent"), (UNCLASSIFIED_ID, "unclassified")]
+    groups: list[FormatGroup] = []
+    for idx, (fid, kind) in enumerate(order):
+        members = [f for f in analysed if f.format_id == fid]
+        if not members:
+            continue
+        p = profile_group(members, r)
+        if kind == "type":
+            one = r.type_one_line(fid)
+            recipe = group_recipe(p, r, opening_line=one)
+        elif kind == "silent":
+            one = r.silent_one_line
+            recipe = group_recipe(p, r, opening_line=None)
         else:
-            resolved.append((*rule_based_name(p, r), "rule"))
-    # Rule-based names can collide (same opening, same conclusion band); tell them apart by length.
-    counts = Counter(n for n, _, _, _ in resolved)
-    for new_id, (name, one_line, recipe, src) in enumerate(resolved):
-        if counts[name] > 1 and src == "rule" and profiles[new_id]["duration"]:
-            resolved[new_id] = (f"{name}（{int(profiles[new_id]['duration']['median'])}秒前後）", one_line, recipe, src)
-    for new_id, (_, members) in enumerate(ordered):
-        p = profiles[new_id]
-        name, one_line, recipe, src = resolved[new_id]
-        examples = sorted(members, key=lambda m: -m.view_count)[:N_EXAMPLES]
-        clusters.append(FormatCluster(
-            cluster_id=new_id, name=name, one_line=one_line, recipe=recipe,
-            size=len(members), share=round(len(members) / total, 2), profile=p,
-            examples=[{"title": m.title, "url": m.url, "view_count": m.view_count, "duration_sec": m.duration_sec}
-                      for m in examples],
-            naming_source=src,
+            one = "どの型のルールにも当たらなかった動画"
+            recipe = []
+        groups.append(FormatGroup(
+            format_id=fid, kind=kind, name=r.type_name(fid), one_line=group_one_line(one, p), recipe=recipe,
+            size=len(members), share=round(len(members) / total, 2) if total else 0.0, profile=p,
+            examples=[{"title": m.title, "url": m.url, "view_count": m.view_count, "duration_sec": m.duration_sec,
+                       "thumbnail_url": m.thumbnail_url}
+                      for m in sorted(members, key=lambda m: -m.view_count)[:N_EXAMPLES]],
+            members=[m.video_id for m in members], order=idx,
         ))
-    return clusters, without, llm_error
+    return groups
+
+
+# ---- discovery (unclassified only) ------------------------------------------
+
+def _standardise(rows: list[list[float]]) -> list[list[float]]:
+    import numpy as np
+    X = np.asarray(rows, dtype=float)
+    mu, sd = X.mean(axis=0), X.std(axis=0)
+    sd[sd == 0] = 1.0
+    return ((X - mu) / sd).tolist()
+
+
+def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int = 6, seed: int = 0,
+                     min_size: int = 2) -> list[int]:
+    """KMeans labels for discovery. Single cluster when there is too little data."""
+    n = len(feats)
+    max_k = min(max_k, n // max(1, min_size))
+    if max_k < 2:
+        return [0] * n
+    import warnings
+    from sklearn.cluster import KMeans
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.metrics import silhouette_score
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)  # duplicate points in tiny discovery sets
+    X = _standardise([f.vector() for f in feats])
+    if k is None:
+        best_k, best_s = 2, -1.0
+        for kk in range(2, max_k + 1):
+            labels = KMeans(n_clusters=kk, n_init=10, random_state=seed).fit_predict(X)
+            if len(set(labels)) < 2:
+                continue
+            s = silhouette_score(X, labels)
+            if s > best_s:
+                best_k, best_s = kk, s
+        k = best_k
+    return [int(x) for x in KMeans(n_clusters=max(1, min(k, n)), n_init=10, random_state=seed).fit_predict(X)]
+
+
+_RE_KANA_WORD = re.compile(r"[ぁ-んァ-ヶー一-龠々]{2,12}")
+
+
+def common_phrases(texts: list[str], top: int = 10) -> list[tuple[str, int]]:
+    """Character n-grams (2-12) that appear in at least two of the texts, longest-first among ties."""
+    counts: Counter[str] = Counter()
+    for t in texts:
+        grams: set[str] = set()
+        s = re.sub(r"\s+", "", t)
+        for n in range(2, 13):
+            grams.update(s[i:i + n] for i in range(len(s) - n + 1))
+        counts.update(g for g in grams if _RE_KANA_WORD.fullmatch(g))
+    hits = [(g, c) for g, c in counts.items() if c >= 2]
+    # drop n-grams fully contained in a longer n-gram with the same count
+    hits.sort(key=lambda gc: (-gc[1], -len(gc[0])))
+    kept: list[tuple[str, int]] = []
+    for g, c in hits:
+        if any(g in k and c == kc for k, kc in kept):
+            continue
+        kept.append((g, c))
+        if len(kept) >= top:
+            break
+    return kept
+
+
+def discover_unclassified(feats: list[Features], rules: Rules | None = None) -> list[dict[str, Any]] | None:
+    """Clusters of unclassified videos, or None when there are fewer than the threshold."""
+    r = rules or get_rules()
+    un = [f for f in feats if f.format_id == UNCLASSIFIED_ID and f.speech == "speech"]
+    if len(un) < r.discovery_min_unclassified:
+        return None
+    labels = cluster_features(un)
+    out = []
+    for lab in sorted(set(labels), key=lambda l: -labels.count(l)):
+        members = [f for f, l in zip(un, labels) if l == lab]
+        out.append({
+            "size": len(members),
+            "openings": [{"text": m.opening_text, "title": m.title, "url": m.url} for m in members],
+            "common_phrases": common_phrases([m.opening_text for m in members]),
+            "profile": profile_group(members, r),
+        })
+    return out

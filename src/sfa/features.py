@@ -3,27 +3,29 @@
 Everything here is derived from the transcript (timing + text) and the
 video metadata (title, duration). No visual analysis, no colour, no product
 placement: those are not units a creator can act on in a brief.
+(A thumbnail URL is carried for the operator to look at; it is never fetched
+or analysed.)
 
-The regexes, brand lists, CTA verbs and thresholds are NOT in this file.
-They come from config/rules.yaml (private) or config/rules.example.yaml via
+The patterns, brand lists, markers and thresholds are NOT in this file. They
+come from config/rules.yaml (private) or config/rules.example.yaml via
 :mod:`sfa.rules`, so the framework can be public while the judgement rules
 stay with the operator.
 
-Brand / product names are matched against the TITLE, not the transcript:
-auto-generated captions mangle katakana proper nouns (observed: ポンデポテイト,
-じゃじゃらポテト, 相引きにグ), so a keyword list cannot hit them in ASR text.
-Titles are typed by the uploader and keep the names intact. Every other
-feature still comes from the transcript.
+Brand names are matched against the TITLE only (hashtags removed): automatic
+captions mangle katakana proper nouns (ポンデポテイト, 相引きにグ), so a keyword
+list cannot hit them in ASR text. Brand is a subject feature, not an opening
+type.
 
 Features
-  opening_type        first-N-second utterance type
-  topic_shifts        count + relative timings of lexical topic changes
-  conclusion_pos      前半 / 中盤 / 後半 / なし
-  question            present? + relative position
-  cta                 present? + relative position
+  speech              speech | silent | no_transcript | not_fetched
+  format_id           opening type id from the rules, "silent" or "unclassified"
+  completion          present? + relative position   (旧「結論位置」)
+  question / cta      present? + relative position
+  bulk_input          present? (independent of the opening type)
+  brand               brand found in the title, or None
   speech_density      characters per second
-  duration_sec
-  title_type          title pattern
+  duration_sec, title_type
+  topic_shifts        reference only: NOT used for typing or profiles
 """
 from __future__ import annotations
 
@@ -31,20 +33,15 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .rules import OTHER, Rules, load_rules
+from .rules import OTHER, SILENT_ID, UNCLASSIFIED_ID, Rules, load_rules
 from .transcript import Transcript
 from .youtube import Video
 
-POSITIONS = ["前半", "中盤", "後半"]  # 0-33% / 34-66% / 67-100%
-PRODUCT_TYPE = "商品名"  # opening type whose evidence comes from the title
-_RE_HASHTAG = re.compile(r"[#＃]\S+")
-
-
-def title_for_matching(title: str) -> str:
-    """Title without hashtags (#shorts, #料理 ...), which would otherwise match every rule."""
-    return _RE_HASHTAG.sub(" ", title or "").strip()
-
 _DEFAULT_RULES: Rules | None = None
+_RE_HASHTAG = re.compile(r"[#＃]\S+")
+# Caption annotations that are not speech: [Music], [音楽], (拍手), ♪ ...
+_RE_NON_SPEECH = re.compile(r"\[[^\]]*\]|［[^］]*］|\([^)]*\)|（[^）]*）|[♪♫♬]")
+_RE_NON_CHARS = re.compile(r"[\s\W_]+", re.UNICODE)
 
 
 def get_rules() -> Rules:
@@ -60,6 +57,72 @@ def set_rules(rules: Rules | None) -> None:
     _DEFAULT_RULES = rules
 
 
+def title_for_matching(title: str) -> str:
+    """Title without hashtags (#shorts, #料理 ...), which would otherwise match broad rules."""
+    return _RE_HASHTAG.sub(" ", title or "").strip()
+
+
+def speech_chars(text: str) -> int:
+    """Characters of actual speech: caption annotations, symbols and spaces removed."""
+    return len(_RE_NON_CHARS.sub("", _RE_NON_SPEECH.sub("", text or "")))
+
+
+def classify_speech(tr: Transcript | None, lang: str, rules: Rules | None = None) -> str:
+    """speech | silent | other_lang | no_transcript.
+
+    Silent is decided BEFORE the language: a caption track that only says
+    [Music] / [Applause] is tagged 'en' by YouTube, but the video simply has
+    no speech, so it belongs to the silent type, not to the excluded languages.
+    """
+    r = rules or get_rules()
+    if tr is None or not tr.segments:
+        return "no_transcript"
+    if speech_chars(tr.text) < r.silent_max_chars:
+        return "silent"
+    return "speech" if tr.is_lang(lang) else "other_lang"
+
+
+def position_label(rel: float | None, rules: Rules | None = None) -> str:
+    if rel is None:
+        return "なし"
+    r = rules or get_rules()
+    pct = rel * 100
+    # Bands are ordered and contiguous in whole percent (0-33 / 34-66 / 67-100); 33.4% is still 前半.
+    for name, (_lo, hi) in r.position_bands.items():
+        if pct < hi + 1:
+            return name
+    return list(r.position_bands)[-1]
+
+
+def classify_opening(text: str, rules: Rules | None = None) -> str | None:
+    """Opening type id: the first type in rules order whose match holds. None = unclassified."""
+    r = rules or get_rules()
+    t = (text or "").strip()
+    if not t:
+        return None
+    for ot in r.opening_types:
+        if ot.matches(t):
+            return ot.id
+    return None
+
+
+def classify_title(title: str, rules: Rules | None = None) -> str:
+    r = rules or get_rules()
+    t = title_for_matching(title)
+    for name in r.title_order:
+        if r.title_patterns[name].search(t):
+            return name
+    return OTHER
+
+
+def find_brand(title: str, rules: Rules | None = None) -> str | None:
+    r = rules or get_rules()
+    if r.brand_pattern is None:
+        return None
+    m = r.brand_pattern.search(title_for_matching(title))
+    return m.group(0) if m else None
+
+
 def _bigrams(s: str) -> set[str]:
     s = re.sub(r"\s+", "", s)
     return {s[i:i + 2] for i in range(len(s) - 1)}
@@ -71,50 +134,9 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
-def position_label(rel: float | None) -> str:
-    if rel is None:
-        return "なし"
-    pct = rel * 100
-    return POSITIONS[0] if pct <= 33 else POSITIONS[1] if pct <= 66 else POSITIONS[2]
-
-
-def classify_opening(text: str, rules: Rules | None = None, *, title: str | None = None) -> str:
-    """Classify the opening utterance. Evaluated in ``rules.opening_order``; first match wins.
-
-    The 商品名 rule is tested against ``title`` (hashtags removed) when a title
-    is given, because brand names do not survive ASR. Without a title (direct
-    calls, older callers) it falls back to the opening text.
-    """
-    r = rules or get_rules()
-    t = text.strip()
-    if not t:
-        return OTHER
-    product_src = title_for_matching(title) if title is not None else t
-    for name in r.opening_order:
-        src = product_src if name == PRODUCT_TYPE else t
-        if src and r.opening_patterns[name].search(src):
-            return name
-    if r.opening_fallback_conclusion and r.opening_fallback_conclusion.search(t):
-        return "結論先出し" if "結論先出し" in r.opening_patterns else OTHER
-    return OTHER
-
-
-def classify_title(title: str, rules: Rules | None = None) -> str:
-    r = rules or get_rules()
-    t = title.strip()
-    for name in r.title_order:
-        if r.title_patterns[name].search(t):
-            return name
-    return OTHER
-
-
 def topic_shifts(tr: Transcript, *, window_sec: float | None = None, threshold: float | None = None,
                  rules: Rules | None = None) -> list[float]:
-    """Relative timings (0..1) where the vocabulary changes sharply.
-
-    Consecutive windows are compared with character-bigram Jaccard
-    similarity; a drop below the threshold marks a shift.
-    """
+    """Reference only. Relative timings (0..1) where the vocabulary changes sharply."""
     r = rules or get_rules()
     window_sec = r.topic_shift_window_sec if window_sec is None else window_sec
     threshold = r.topic_shift_jaccard if threshold is None else threshold
@@ -136,7 +158,9 @@ def topic_shifts(tr: Transcript, *, window_sec: float | None = None, threshold: 
     return shifts
 
 
-def _first_match_position(tr: Transcript, pattern: re.Pattern[str]) -> float | None:
+def _first_match_position(tr: Transcript, pattern: re.Pattern[str] | None) -> float | None:
+    if pattern is None:
+        return None
     end = max((s.end for s in tr.segments), default=0.0)
     if end <= 0:
         return None
@@ -146,6 +170,11 @@ def _first_match_position(tr: Transcript, pattern: re.Pattern[str]) -> float | N
     return None
 
 
+def thumbnail_url(video_id: str) -> str:
+    """Public thumbnail URL for the operator to look at. Never fetched by this tool."""
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 @dataclass
 class Features:
     video_id: str
@@ -153,70 +182,68 @@ class Features:
     url: str
     duration_sec: int
     view_count: int
-    has_transcript: bool
-    opening_type: str
+    speech: str                      # speech | silent | no_transcript | not_fetched
+    format_id: str                   # opening type id | silent | unclassified
     opening_text: str
-    n_topic_shifts: int
-    topic_shift_positions: list[float]
-    conclusion_pos: str
-    conclusion_rel: float | None
-    question_pos: str
+    completion_rel: float | None
     question_rel: float | None
-    cta_pos: str
     cta_rel: float | None
+    bulk_input: bool
+    brand: str | None
     speech_density: float
     title_type: str
+    language: str = ""
     transcript_chars: int = 0
+    n_topic_shifts: int = 0          # reference only
+    thumbnail_url: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_transcript(self) -> bool:
+        return self.speech == "speech"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    # -- numeric vector for clustering -------------------------------------
+    # -- numeric vector, used only by the discovery clustering of unclassified videos
     @staticmethod
-    def vector_names(rules: Rules | None = None) -> list[str]:
-        r = rules or get_rules()
-        return (["duration_sec", "speech_density", "n_topic_shifts", "conclusion_rel", "question_rel", "cta_rel",
-                 "has_question", "has_cta"]
-                + [f"open:{o}" for o in r.opening_types] + [f"title:{t}" for t in r.title_types])
+    def vector_names() -> list[str]:
+        return ["duration_sec", "speech_density", "completion_rel", "question_rel", "cta_rel",
+                "has_completion", "has_question", "has_cta", "bulk_input"]
 
     def vector(self, rules: Rules | None = None) -> list[float]:
-        r = rules or get_rules()
-
         def rel(x: float | None) -> float:
-            return -0.5 if x is None else x  # "absent" is its own point, away from 0..1
-        return ([float(self.duration_sec), self.speech_density, float(self.n_topic_shifts),
-                 rel(self.conclusion_rel), rel(self.question_rel), rel(self.cta_rel),
-                 float(self.question_rel is not None), float(self.cta_rel is not None)]
-                + [1.0 if self.opening_type == o else 0.0 for o in r.opening_types]
-                + [1.0 if self.title_type == t else 0.0 for t in r.title_types])
+            return -0.5 if x is None else x
+        return [float(self.duration_sec), self.speech_density, rel(self.completion_rel), rel(self.question_rel),
+                rel(self.cta_rel), float(self.completion_rel is not None), float(self.question_rel is not None),
+                float(self.cta_rel is not None), float(self.bulk_input)]
 
 
-def extract_features(video: Video, tr: Transcript | None, rules: Rules | None = None) -> Features:
+def extract_features(video: Video, tr: Transcript | None, rules: Rules | None = None, *,
+                     speech: str | None = None, lang: str = "ja") -> Features:
+    """``speech`` may be given by the caller (e.g. 'not_fetched'); otherwise it is derived from ``tr``."""
     r = rules or get_rules()
-    title_type = classify_title(video.title, r)
-    if tr is None or not tr.segments:
-        return Features(
-            video_id=video.video_id, title=video.title, url=video.url, duration_sec=video.duration_sec,
-            view_count=video.view_count, has_transcript=False,
-            opening_type=OTHER, opening_text="", n_topic_shifts=0, topic_shift_positions=[],
-            conclusion_pos="なし", conclusion_rel=None, question_pos="なし", question_rel=None,
-            cta_pos="なし", cta_rel=None, speech_density=0.0, title_type=title_type,
-        )
+    kind = speech or classify_speech(tr, lang, r)
+    base = dict(video_id=video.video_id, title=video.title, url=video.url, duration_sec=video.duration_sec,
+                view_count=video.view_count, title_type=classify_title(video.title, r),
+                brand=find_brand(video.title, r), thumbnail_url=thumbnail_url(video.video_id),
+                language=(tr.language if tr else ""))
+    if kind != "speech" or tr is None:
+        fid = SILENT_ID if kind in ("silent", "no_transcript") else UNCLASSIFIED_ID
+        return Features(**base, speech=kind, format_id=fid, opening_text="", completion_rel=None,
+                        question_rel=None, cta_rel=None, bulk_input=False, speech_density=0.0,
+                        transcript_chars=tr.total_chars if tr else 0)
     opening = tr.text_between(0.0, r.opening_window_sec)
-    shifts = topic_shifts(tr, rules=r)
-    c_rel = _first_match_position(tr, r.conclusion)
-    q_rel = _first_match_position(tr, r.question)
-    cta_rel = _first_match_position(tr, r.cta)
     dur = video.duration_sec or max((s.end for s in tr.segments), default=0.0) or 1.0
     return Features(
-        video_id=video.video_id, title=video.title, url=video.url, duration_sec=video.duration_sec,
-        view_count=video.view_count, has_transcript=True,
-        opening_type=classify_opening(opening, r, title=video.title), opening_text=opening[:80],
-        n_topic_shifts=len(shifts), topic_shift_positions=shifts,
-        conclusion_pos=position_label(c_rel), conclusion_rel=c_rel,
-        question_pos=position_label(q_rel), question_rel=q_rel,
-        cta_pos=position_label(cta_rel), cta_rel=cta_rel,
+        **base, speech="speech",
+        format_id=classify_opening(opening, r) or UNCLASSIFIED_ID,
+        opening_text=opening[:80],
+        completion_rel=_first_match_position(tr, r.completion),
+        question_rel=_first_match_position(tr, r.question),
+        cta_rel=_first_match_position(tr, r.cta),
+        bulk_input=bool(r.bulk_input and r.bulk_input.search(tr.text)),
         speech_density=round(tr.total_chars / float(dur), 2),
-        title_type=title_type, transcript_chars=tr.total_chars,
+        transcript_chars=tr.total_chars,
+        n_topic_shifts=len(topic_shifts(tr, rules=r)),
     )

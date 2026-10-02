@@ -1,8 +1,9 @@
-"""Render the Markdown report.
+"""Render the Markdown report (and the separate discovery file).
 
 Rules: no abstract adjectives; describe with seconds, order and structure;
-numbers as quartile ranges, never a lone point; at most three example URLs
-per format; say plainly when transcripts were missing.
+numbers as quartile ranges, never a lone point; rates before positions; at
+most three example URLs per format; ASR examples carry a disclaimer; every
+unclassified opening is listed in full (it is the input for new rules).
 """
 from __future__ import annotations
 
@@ -12,7 +13,9 @@ from datetime import date
 from typing import Any
 
 from .features import Features, get_rules
-from .formats import N_EXAMPLES, FormatCluster, fmt_position, fmt_range, quartiles
+from .formats import N_EXAMPLES, FormatGroup, fmt_position, fmt_range, quartiles
+
+ASR_NOTE = "実例は自動文字起こしのため表記に誤りがあります。"
 
 
 @dataclass
@@ -20,24 +23,21 @@ class ReportMeta:
     genre: str
     report_date: date
     n_requested: int
-    n_videos: int
-    n_with_transcript: int
+    n_collected: int
     transcript_backend: str
     quota_used: int
     quota_budget: int
-    partial: bool = False
-    llm_error: str | None = None
-    naming_model: str | None = None
-    notes: list[str] | None = None
-    transcripts_aborted: str | None = None   # set when the backend was blocked mid-run
-    transcripts_capped: bool = False         # --max-transcripts reached
-    n_transcript_unavailable: int | None = None  # video has no transcript (final)
-    n_transcript_not_fetched: int | None = None  # not fetched yet: blocked / capped / transient error
-    n_lang_excluded: int = 0                 # transcript not in transcript_lang -> removed from analysis
+    n_other_lang: int = 0
+    n_not_fetched: int = 0
     transcript_lang: str = "ja"
-    collection_route: str = "search"         # search | channels
-    n_collected: int | None = None           # Shorts collected before the language filter
-    credits_exhausted: bool = False          # transcript API monthly credits reached
+    collection_route: str = "search"
+    partial: bool = False
+    credits_exhausted: bool = False
+    transcripts_aborted: str | None = None
+    transcripts_capped: bool = False
+    rules_source: str = ""
+    reclassified_from_cache: bool = False
+    notes: list[str] | None = None
 
 
 def _pct(x: float) -> str:
@@ -48,163 +48,209 @@ def _shares(share: dict[str, float]) -> str:
     return "、".join(f"{k} {_pct(v)}" for k, v in share.items()) or "なし"
 
 
-def _overall(feats: list[Features]) -> list[str]:
-    n = len(feats)
+def _analysed(feats: list[Features]) -> list[Features]:
+    return [f for f in feats if f.speech in ("speech", "silent", "no_transcript")]
+
+
+def _overall(feats: list[Features], groups: list[FormatGroup]) -> list[str]:
+    a = _analysed(feats)
+    n = len(a)
     if n == 0:
-        return ["対象動画なし。"]
-    r = get_rules()
-    durs = [f.duration_sec for f in feats]
-    lines = ["## 全体の傾向", ""]
-    lines.append(f"- 対象本数: {n} 本（字幕あり {sum(f.has_transcript for f in feats)} 本）")
-    lines.append(f"- 尺: {fmt_range(quartiles(durs, 0), '秒')}、最短 {min(durs)} 秒、最長 {max(durs)} 秒")
+        return ["対象動画なし。", ""]
+    spoken = [f for f in a if f.speech == "speech"]
+    L = ["## 全体の傾向", ""]
+    L.append(f"- 分析本数: {n} 本（発話あり {len(spoken)} 本、発話なし {n - len(spoken)} 本）")
+    durs = [f.duration_sec for f in a]
+    L.append(f"- 尺: {fmt_range(quartiles(durs, 0), '秒')}、最短 {min(durs)} 秒、最長 {max(durs)} 秒")
     buckets = Counter("〜15秒" if d <= 15 else "16〜30秒" if d <= 30 else "31〜60秒" if d <= 60 else "61秒〜" for d in durs)
-    lines.append("- 尺の分布: " + "、".join(f"{k} {_pct(v / n)}" for k, v in sorted(buckets.items())))
-    with_tr = [f for f in feats if f.has_transcript]
-    if with_tr:
-        m = len(with_tr)
-        op = Counter(f.opening_type for f in with_tr)
-        lines.append(f"- 冒頭{int(r.opening_window_sec)}秒の発話タイプ: "
-                     + "、".join(f"{k} {_pct(op[k] / m)}" for k in r.opening_types if op[k]))
-        lines.append(f"- 問いかけあり: {_pct(sum(f.question_rel is not None for f in with_tr) / m)}、"
-                     f"CTAあり: {_pct(sum(f.cta_rel is not None for f in with_tr) / m)}")
-        lines.append(f"- 発話密度: {fmt_range(quartiles([f.speech_density for f in with_tr], 1), '文字/秒', nd=1)}")
-    tt = Counter(f.title_type for f in feats)
-    lines.append("- タイトルの型: " + "、".join(f"{k} {_pct(v / n)}" for k, v in tt.most_common()))
-    lines.append("")
-    return lines
+    L.append("- 尺の分布: " + "、".join(f"{k} {_pct(buckets[k] / n)}" for k in ("〜15秒", "16〜30秒", "31〜60秒", "61秒〜") if buckets[k]))
+    L.append("- 型の分布: " + "、".join(f"{g.name} {_pct(g.share)}" for g in groups))
+    if spoken:
+        m = len(spoken)
+        L.append(f"- 発話密度: {fmt_range(quartiles([f.speech_density for f in spoken], 1), '文字/秒', nd=1)}")
+        for attr, label in (("completion_rel", "完成の提示"), ("question_rel", "問いかけ"), ("cta_rel", "CTA")):
+            L.append(f"- {label}: {_pct(sum(getattr(f, attr) is not None for f in spoken) / m)}の動画にあり")
+        L.append(f"- 大量投入: {_pct(sum(f.bulk_input for f in spoken) / m)}の動画にあり")
+    L.append(f"- タイトルにブランド名: {_pct(sum(f.brand is not None for f in a) / n)}")
+    tt = Counter(f.title_type for f in a)
+    L.append("- タイトルの型: " + "、".join(f"{k} {_pct(v / n)}" for k, v in tt.most_common()))
+    L.append("")
+    return L
 
 
-def _cluster_section(c: FormatCluster) -> list[str]:
-    p = c.profile
-    small = c.small_sample
-    r = get_rules()
-    lines = [f"## フォーマット {c.cluster_id + 1}: {c.name}", ""]
-    lines.append(f"該当 {c.size} 本（字幕あり動画の {_pct(c.share)}）。{c.one_line}")
-    if small:
-        lines.append("")
-        lines.append(f"> **注意**: n={c.size} のため傾向の参考値。範囲は出さず中央値のみ示す。")
-    lines.append("")
-    lines.append("**構成レシピ**")
-    lines.append("")
-    lines += [f"{i}. {step}" for i, step in enumerate(c.recipe, 1)]
-    lines.append("")
-    lines.append("**数値プロファイル**" + ("（Q1〜Q3 の範囲、括弧内は中央値）" if not small else "（中央値のみ、参考値）"))
-    lines.append("")
-    lines.append("| 項目 | 値 |")
-    lines.append("|---|---|")
-    lines.append(f"| 尺 | {fmt_range(p['duration'], '秒', small=small)} |")
-    lines.append(f"| 冒頭{int(r.opening_window_sec)}秒の発話タイプ | {_shares(p['opening_type'])} |")
-    lines.append(f"| 結論の位置 | {fmt_position(p['conclusion'], small=small)}（区分の内訳: {_shares(p['conclusion_pos'])}） |")
-    for key, label in (("question", "問いかけ"), ("cta", "CTA")):
-        pr = p[key]
-        val = f"{_pct(pr['share'])}の動画にあり" + (f"、尺の{fmt_position(pr, small=small)}" if pr["pos"] else "")
-        lines.append(f"| {label} | {val} |")
-    lines.append(f"| 話題転換 | {fmt_range(p['topic_shifts'], '回', small=small)} |")
-    lines.append(f"| 発話密度 | {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)} |")
-    lines.append(f"| タイトルの型 | {_shares(p['title_type'])} |")
-    lines.append("")
-    if p.get("opening_examples"):
-        lines.append(f"**冒頭{int(r.opening_window_sec)}秒の実例**")
-        lines.append("")
-        lines += [f"- 「{t}」" for t in p["opening_examples"][:3]]
-        lines.append("")
-    lines.append(f"**該当動画（再生数上位 {N_EXAMPLES} 本）**")
-    lines.append("")
-    shown = c.examples[:N_EXAMPLES]
-    for ex in shown:
-        lines.append(f"- [{ex['title']}]({ex['url']}) — {ex['duration_sec']} 秒、{ex['view_count']:,} 回")
-    rest = c.size - len(shown)
+def _examples(g: FormatGroup, *, thumbnails: bool = False) -> list[str]:
+    L = [f"**該当動画（再生数上位 {N_EXAMPLES} 本）**", ""]
+    for ex in g.examples[:N_EXAMPLES]:
+        line = f"- [{ex['title']}]({ex['url']}) — {ex['duration_sec']} 秒、{ex['view_count']:,} 回"
+        if thumbnails:
+            line += f"（[サムネイル]({ex['thumbnail_url']})）"
+        L.append(line)
+    rest = g.size - len(g.examples[:N_EXAMPLES])
     if rest > 0:
-        lines.append(f"- 他 {rest} 本")
-    lines.append("")
-    return lines
+        L.append(f"- 他 {rest} 本")
+    L.append("")
+    return L
 
 
-def _no_transcript_section(without: list[Features], meta: "ReportMeta | None" = None) -> list[str]:
-    if not without:
-        return []
-    n = len(without)
-    lines = ["## 字幕が取得できなかった動画", ""]
-    lines.append(f"{n} 本は字幕がないため、タイトルと尺のみで集計した。")
-    if meta is not None and meta.n_transcript_unavailable is not None and meta.n_transcript_not_fetched is not None:
-        lines.append(f"- 動画側に字幕がない: {meta.n_transcript_unavailable} 本")
-        lines.append(f"- 取得を中断したため未取得: {meta.n_transcript_not_fetched} 本（再実行で取得できる可能性がある）")
-    tt = Counter(f.title_type for f in without)
-    lines.append("- タイトルの型: " + "、".join(f"{k} {_pct(v / n)}" for k, v in tt.most_common()))
-    lines.append(f"- 尺: {fmt_range(quartiles([f.duration_sec for f in without], 0), '秒', small=n < get_rules().min_cluster_for_ranges)}")
-    lines.append("")
-    shown = sorted(without, key=lambda x: -x.view_count)[:N_EXAMPLES]
-    for f in shown:
-        lines.append(f"- [{f.title}]({f.url}) — {f.duration_sec} 秒、{f.view_count:,} 回")
-    if n > len(shown):
-        lines.append(f"- 他 {n - len(shown)} 本")
-    lines.append("")
-    return lines
-
-
-def render_report(meta: ReportMeta, feats: list[Features], clusters: list[FormatCluster],
-                  without: list[Features]) -> str:
+def _type_section(g: FormatGroup, idx: int) -> list[str]:
+    p = g.profile
+    small = g.small_sample
     r = get_rules()
-    L: list[str] = []
-    L.append(f"# YouTube Shorts 構成フォーマット分析: {meta.genre}")
+    L = [f"## フォーマット {idx}: {g.name}", ""]
+    L.append(f"該当 {g.size} 本（分析対象の {_pct(g.share)}）。{g.one_line}")
+    if small:
+        L += ["", f"> **注意**: n={g.size} のため傾向の参考値。範囲は出さず中央値のみ示す。"]
+    L += ["", "**構成レシピ**", ""]
+    L += [f"{i}. {step}" for i, step in enumerate(g.recipe, 1)]
+    L += ["", "**数値プロファイル**" + ("（Q1〜Q3 の範囲、括弧内は中央値）" if not small else "（中央値のみ、参考値）"), ""]
+    L += ["| 項目 | 値 |", "|---|---|"]
+    L.append(f"| 尺 | {fmt_range(p['duration'], '秒', small=small)} |")
+    L.append(f"| 発話密度 | {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)} |")
+    for key, label in (("completion", "完成の提示"), ("question", "問いかけ"), ("cta", "CTA")):
+        L.append(f"| {label} | {fmt_position(p[key], small=small)} |")
+    L.append(f"| 大量投入 | {_pct(p['bulk_input_share'])}の動画にあり |")
+    brands = "、".join(f"{b} {c}本" for b, c in p["brands"].items())
+    L.append(f"| タイトルにブランド名 | {_pct(p['brand_share'])}" + (f"（{brands}）" if brands else "") + " |")
+    L.append(f"| タイトルの型 | {_shares(p['title_type'])} |")
     L.append("")
-    L.append(f"作成日: {meta.report_date.isoformat()}")
+    if p.get("opening_examples"):
+        L += [f"**冒頭{int(r.opening_window_sec)}秒の実例**", ""]
+        L += [f"- 「{t}」" for t in p["opening_examples"][:3]]
+        L += ["", f"※{ASR_NOTE}", ""]
+    L += _examples(g)
+    return L
+
+
+def _silent_section(g: FormatGroup, idx: int) -> list[str]:
+    p = g.profile
+    small = g.small_sample
+    kinds = p.get("speech_kinds", {})
+    L = [f"## フォーマット {idx}: {g.name}", ""]
+    L.append(f"該当 {g.size} 本（分析対象の {_pct(g.share)}）。{g.one_line}")
+    if small:
+        L += ["", f"> **注意**: n={g.size} のため傾向の参考値。範囲は出さず中央値のみ示す。"]
+    L += ["", "**この型に入れた根拠**", ""]
+    L.append(f"- 字幕が音楽・効果音の表記だけ（発話なしと確認）: {kinds.get('silent', 0)} 本")
+    L.append(f"- 字幕がない（発話の有無は未確認）: {kinds.get('no_transcript', 0)} 本")
+    if kinds.get("no_transcript"):
+        L.append("  - 字幕がないのは、投稿者が字幕を無効にしている場合もある。**納品前にサムネイルと動画で目視確認すること。**")
+    L += ["", "**数値プロファイル**" + ("（Q1〜Q3 の範囲、括弧内は中央値）" if not small else "（中央値のみ、参考値）"), ""]
+    L += ["| 項目 | 値 |", "|---|---|"]
+    L.append(f"| 尺 | {fmt_range(p['duration'], '秒', small=small)} |")
+    brands = "、".join(f"{b} {c}本" for b, c in p["brands"].items())
+    L.append(f"| タイトルにブランド名 | {_pct(p['brand_share'])}" + (f"（{brands}）" if brands else "") + " |")
+    L.append(f"| タイトルの型 | {_shares(p['title_type'])} |")
     L.append("")
-    L.append("## この資料について")
+    L += _examples(g, thumbnails=True)
+    return L
+
+
+def _unclassified_section(g: FormatGroup, feats: list[Features]) -> list[str]:
+    members = [f for f in feats if f.video_id in set(g.members)]
+    L = ["## 未分類", ""]
+    L.append(f"{g.size} 本（分析対象の {_pct(g.share)}）は、どの型のルールにも当たらなかった。"
+             "冒頭テキストを全件載せる。ルールを足す材料にする。")
+    L += ["", f"※{ASR_NOTE}", ""]
+    for f in sorted(members, key=lambda x: -x.view_count):
+        L.append(f"- 「{f.opening_text}」 — [{f.title[:40]}]({f.url})")
     L.append("")
-    collected = meta.n_collected if meta.n_collected is not None else meta.n_videos
+    return L
+
+
+def render_report(meta: ReportMeta, feats: list[Features], groups: list[FormatGroup]) -> str:
+    r = get_rules()
+    a = _analysed(feats)
+    n_spoken = sum(f.speech == "speech" for f in a)
+    L: list[str] = [f"# YouTube Shorts 構成フォーマット分析: {meta.genre}", "", f"作成日: {meta.report_date.isoformat()}", ""]
+    L += ["## この資料について", ""]
     source = (f"検索語「{meta.genre}」で再生数上位の Shorts" if meta.collection_route == "search"
               else f"「{meta.genre}」の主要チャンネルが投稿した Shorts のうち再生数上位")
-    L.append(f"{source}を {meta.n_requested} 本を目標に収集し、{collected} 本を集めた。"
-             + (f"字幕が日本語以外だった {meta.n_lang_excluded} 本を除き、" if meta.n_lang_excluded else "")
-             + f"{meta.n_videos} 本を分析した。うち字幕（発話テキスト）が取れたのは {meta.n_with_transcript} 本。")
-    L.append(f"字幕とメタデータから、冒頭{int(r.opening_window_sec)}秒の入り方・結論の位置・問いかけ・CTA・話題転換・尺を取り出し、"
-             "似た構成の動画をまとめて「フォーマット」として名前を付けた。")
-    L.append("数値は四分位範囲（該当動画の中央 50% が収まる幅）で示す。位置の区分は 前半（0〜33%）／中盤（34〜66%）／後半（67〜100%）。")
-    L.append("再生数の予測はしていない。今この検索語で上位にある動画の構成を、そのまま記述したもの。")
+    source += " "
+    excl = []
+    if meta.n_other_lang:
+        excl.append(f"字幕が日本語以外だった {meta.n_other_lang} 本")
+    if meta.n_not_fetched:
+        excl.append(f"字幕を未取得の {meta.n_not_fetched} 本")
+    L.append(f"{source}を {meta.n_requested} 本を目標に収集し、{meta.n_collected} 本を集めた。"
+             + (f"{'と'.join(excl)}を除き、" if excl else "")
+             + f"{len(a)} 本を分析した（発話あり {n_spoken} 本、発話なし {len(a) - n_spoken} 本）。")
+    L.append(f"冒頭{int(r.opening_window_sec)}秒の入り方で、あらかじめ定義した型に 1 本ずつ分類した。"
+             "型ごとに、尺・発話の速さ・完成の提示・問いかけ・CTA・大量投入・タイトルを集計した。")
+    L.append("数値は四分位範囲（該当動画の中央 50% が収まる幅）で示す。位置の区分は "
+             + "／".join(f"{k}（{int(lo)}〜{int(hi)}%）" for k, (lo, hi) in r.position_bands.items()) + "。")
+    L.append("再生数の予測はしていない。今この条件で上位にある動画の構成を、そのまま記述したもの。")
     if meta.partial and not meta.credits_exhausted:
-        L.append("")
-        L.append("> **注意**: API の1日あたりの上限に達したため、収集途中のデータで作成している。翌日再実行すると本数が増える。")
+        L += ["", "> **注意**: API の1日あたりの上限に達したため、収集途中のデータで作成している。翌日再実行すると本数が増える。"]
     if meta.credits_exhausted:
-        L.append("")
-        L.append("> **注意**: 字幕取得 API の今月のクレジット上限に達したため、字幕の取得を途中で止めた。翌月の再実行で本数が増える。")
+        L += ["", "> **注意**: 字幕取得 API の今月のクレジット上限に達したため、字幕の取得を途中で止めた。翌月の再実行で本数が増える。"]
     if meta.transcripts_aborted or meta.transcripts_capped:
-        L.append("")
         why = "取得元から接続を制限された" if meta.transcripts_aborted else "1回あたりの取得本数の上限に達した"
-        nf = f"{meta.n_transcript_not_fetched} 本は未取得。" if meta.n_transcript_not_fetched else ""
-        L.append(f"> **注意**: 字幕の取得を途中で止めた（{why}）。{nf}"
-                 "この版はジャンルの傾向ではなく、取得できた分だけの集計。日を改めて再実行すると本数が増える。")
-    if meta.n_with_transcript == 0:
-        L.append("")
-        L.append("> **注意**: 字幕が1本も取得できなかったため、フォーマット抽出は行えなかった。以下はタイトルと尺のみの集計。")
+        nf = f"{meta.n_not_fetched} 本は未取得。" if meta.n_not_fetched else ""
+        L += ["", f"> **注意**: 字幕の取得を途中で止めた（{why}）。{nf}"
+                  "この版はジャンルの傾向ではなく、取得できた分だけの集計。再実行すると本数が増える。"]
+    if meta.n_collected and meta.n_not_fetched == meta.n_collected:
+        L += ["", "> **注意**: 字幕を1本も取得していないため、冒頭の型への分類は行えなかった。"]
+    elif a and n_spoken == 0:
+        L += ["", "> **注意**: 発話のある字幕が1本も取得できなかったため、冒頭の型への分類は行えなかった。"]
     L.append("")
-    L += _overall(feats)
-    if clusters:
-        L.append("## フォーマット一覧")
+    L += _overall(feats, groups)
+    if groups:
+        L += ["## フォーマット一覧", "", "| # | フォーマット | 本数 | 割合 | 一言で |", "|---|---|---|---|---|"]
+        for i, g in enumerate(groups, 1):
+            note = f"（n={g.size} 参考値）" if g.small_sample and g.kind != "unclassified" else ""
+            num = "—" if g.kind == "unclassified" else str(i)
+            L.append(f"| {num} | {g.name} | {g.size} | {_pct(g.share)} | {note}{g.one_line} |")
         L.append("")
-        L.append("| # | フォーマット | 本数 | 割合 | 一言で |")
-        L.append("|---|---|---|---|---|")
-        for c in clusters:
-            note = f"（n={c.size} 参考値）" if c.small_sample else ""
-            L.append(f"| {c.cluster_id + 1} | {c.name} | {c.size} | {_pct(c.share)} | {note}{c.one_line} |")
-        L.append("")
-        for c in clusters:
-            L += _cluster_section(c)
-    L += _no_transcript_section(without, meta)
-    L.append("## 取得条件と制約")
-    L.append("")
+        idx = 0
+        for g in groups:
+            if g.kind == "type":
+                idx += 1
+                L += _type_section(g, idx)
+            elif g.kind == "silent":
+                idx += 1
+                L += _silent_section(g, idx)
+        for g in groups:
+            if g.kind == "unclassified":
+                L += _unclassified_section(g, feats)
+    L += ["## 取得条件と制約", ""]
     L.append(f"- 字幕取得手段: `{meta.transcript_backend}`")
-    if meta.n_lang_excluded:
-        L.append(f"- 言語フィルタ: 字幕の主な言語が `{meta.transcript_lang}` 以外の {meta.n_lang_excluded} 本を分析対象から除外")
-    if meta.naming_model:
-        src = "LLM" if any(c.naming_source == "llm" for c in clusters) else "ルールベース"
-        L.append(f"- フォーマット命名: {src}" + (f"（{meta.naming_model}）" if src == "LLM" else ""))
-    if meta.llm_error:
-        L.append(f"- LLM 命名は失敗したためルールベースの名前を使用: `{meta.llm_error}`")
+    if meta.n_other_lang:
+        L.append(f"- 言語フィルタ: 字幕の主な言語が `{meta.transcript_lang}` 以外の {meta.n_other_lang} 本を分析対象から除外")
+    n_silent_confirmed = sum(f.speech == "silent" for f in a)
+    if n_silent_confirmed:
+        L.append(f"- 発話なし判定: 字幕が音楽・効果音の表記だけの {n_silent_confirmed} 本は、除外せず {r.silent_name}に入れた")
+    if meta.rules_source:
+        L.append(f"- 判定ルール: `{meta.rules_source}`")
+    if meta.reclassified_from_cache:
+        L.append("- この版は保存済みのデータから再集計した（API は使っていない）")
     L.append(f"- YouTube Data API 使用量: {meta.quota_used} / {meta.quota_budget} ユニット（当日分）")
     for n in meta.notes or []:
         L.append(f"- {n}")
     L.append("- **掲載URLは納品前に目視確認すること。** 検索はセーフサーチ無効で行っており、意図しない内容が混じり得る。")
-    L.append("- 動画本体はダウンロードしていない。TikTok / Instagram は対象外。")
+    L.append("- 動画本体はダウンロードしていない。サムネイルは URL を載せるだけで、取得も解析もしていない。TikTok / Instagram は対象外。")
     L.append("")
+    return "\n".join(L)
+
+
+def render_discovery(genre: str, report_date: date, clusters: list[dict[str, Any]] | None, n_unclassified: int) -> str:
+    """Operator-only file: candidate new types among unclassified videos. Never delivered."""
+    r = get_rules()
+    L = [f"# 未分類の動画から型の候補を探す: {genre}", "", f"作成日: {report_date.isoformat()}", ""]
+    L.append("この資料は納品物ではない。`config/rules.yaml` に型を足すための材料。")
+    L.append(f"未分類 {n_unclassified} 本を、尺・発話密度・完成/問いかけ/CTA の有無と位置・大量投入でまとめた。")
+    L += ["", f"※{ASR_NOTE}", ""]
+    if not clusters:
+        L.append(f"未分類が {r.discovery_min_unclassified} 本未満のため、まとめは行っていない。")
+        return "\n".join(L) + "\n"
+    for i, c in enumerate(clusters, 1):
+        p = c["profile"]
+        L += [f"## 候補 {i}（{c['size']} 本）", ""]
+        L.append(f"- 尺: {fmt_range(p['duration'], '秒', small=p['small_sample'])}、"
+                 f"発話密度: {fmt_range(p['speech_density'], '文字/秒', small=p['small_sample'], nd=1)}")
+        L.append(f"- 完成の提示: {fmt_position(p['completion'], small=p['small_sample'])}")
+        if c["common_phrases"]:
+            L.append("- 冒頭に共通する語: " + "、".join(f"「{g}」×{n}" for g, n in c["common_phrases"]))
+        L += ["", "冒頭テキスト（全件）", ""]
+        L += [f"- 「{o['text']}」 — [{o['title'][:40]}]({o['url']})" for o in c["openings"]]
+        L.append("")
     return "\n".join(L)

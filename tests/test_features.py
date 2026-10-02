@@ -1,53 +1,65 @@
 from conftest import make_transcript, make_video
-from sfa.features import classify_opening, classify_title, extract_features, topic_shifts
+from sfa.features import (classify_opening, classify_speech, extract_features, find_brand, position_label,
+                          speech_chars, title_for_matching)
+from sfa.rules import SILENT_ID, UNCLASSIFIED_ID
+from sfa.transcript import Segment, Transcript
 
 
-def test_opening_classification():
-    assert classify_opening("知ってました？実は簡単です") == "問いかけ"
-    assert classify_opening("これ絶対にやめて") == "否定形"
-    assert classify_opening("3分でできる卵料理") == "数値提示"
-    assert classify_opening("結論から言うとこれが正解") == "結論先出し"
-    assert classify_opening("ダイソーの新商品") == "商品名"
-    assert classify_opening("料理が苦手な人") == "呼びかけ"
-    assert classify_opening("") == "その他"
+def test_opening_type_from_rules(recipe_rules):
+    assert classify_opening("やばいレシピ紹介しますまずは大量の", recipe_rules) == "hype_declaration"
+    assert classify_opening("平日には食べないでください", recipe_rules) == "warning"
+    assert classify_opening("最近食べすぎちゃったな。", recipe_rules) is None
+    assert classify_opening("", recipe_rules) is None
 
 
-def test_title_classification():
-    assert classify_title("5分で完成！時短レシピ") == "数値型"
-    assert classify_title("なんで誰も教えてくれないの？") == "疑問型"
-    assert classify_title("絶対にやってはいけない味付け") == "否定型"
-    assert classify_title("最強の卵かけご飯") == "断定型"
+def test_three_way_speech_classification(recipe_rules):
+    music = Transcript("v", "en", [Segment(0, 3, "[Music]"), Segment(9, 4, "[Applause]"), Segment(11, 3, "bre")])
+    thai = Transcript("v", "th", [Segment(14, 3, " 온 ")])
+    english = Transcript("v", "en", [Segment(0, 3, "They are eggs to die for. Crack them into the pan now.")])
+    japanese = make_transcript("v", ["まず卵を割ります", "完成"])
+    assert classify_speech(music, "ja", recipe_rules) == "silent"
+    assert classify_speech(thai, "ja", recipe_rules) == "silent"
+    assert classify_speech(english, "ja", recipe_rules) == "other_lang"
+    assert classify_speech(japanese, "ja", recipe_rules) == "speech"
+    assert classify_speech(None, "ja", recipe_rules) == "no_transcript"
+    assert speech_chars("[Music] ♪ (拍手) あ") == 1
 
 
-def test_extract_features_with_transcript():
-    v = make_video(1, duration=30)
+def test_features_for_speech_video(recipe_rules):
+    v = make_video(1, duration=30, title="ダイソーの道具で 3分 #shorts")
     tr = make_transcript("vid001", [
-        "知ってました？卵は冷蔵庫から出してすぐ使わない",   # 0-3s question
-        "まず卵を常温に戻します",
-        "次にフライパンを温めて油をひきます",
-        "バターを入れて溶かします",
-        "卵を流し込んでゆっくり混ぜます",
-        "火を止めて余熱で仕上げます",
-        "これで完成です",                                   # conclusion late
-        "レシピは保存して作ってみてね",                      # CTA
+        "やばいレシピ紹介しますまずは大量のニンニク",
+        "フライパンで炒めます", "醤油を入れます", "知ってる？ここがコツ",
+        "盛り付けます", "これで完成です", "保存してね", "またね",
     ], seg_dur=3.75)
-    f = extract_features(v, tr)
-    assert f.has_transcript and f.opening_type == "問いかけ"
-    assert f.question_pos == "前半"
-    assert f.conclusion_pos == "後半"
-    assert f.cta_pos == "後半"
-    assert f.speech_density > 0
-    assert len(f.vector()) == len(f.vector_names())
+    f = extract_features(v, tr, recipe_rules)
+    assert f.speech == "speech" and f.format_id == "hype_declaration"
+    assert f.bulk_input is True and f.brand == "ダイソー"
+    assert position_label(f.completion_rel, recipe_rules) == "中盤"  # 6th of 8 segments = 62.5%
+    assert position_label(f.question_rel, recipe_rules) == "前半" or position_label(f.question_rel, recipe_rules) == "中盤"
+    assert f.cta_rel is not None and f.speech_density > 0
+    assert f.thumbnail_url == "https://i.ytimg.com/vi/vid001/hqdefault.jpg"
 
 
-def test_extract_features_without_transcript():
-    f = extract_features(make_video(2), None)
-    assert not f.has_transcript and f.conclusion_pos == "なし" and f.speech_density == 0.0
+def test_unmatched_speech_is_unclassified_and_silent_goes_to_silent_type(recipe_rules):
+    v = make_video(2)
+    assert extract_features(v, make_transcript("vid002", ["最近食べすぎちゃったな。", "完成"]), recipe_rules).format_id == UNCLASSIFIED_ID
+    assert extract_features(v, None, recipe_rules).format_id == SILENT_ID
+    music = Transcript("vid002", "en", [Segment(0, 3, "[Music]")])
+    f = extract_features(v, music, recipe_rules)
+    assert f.speech == "silent" and f.format_id == SILENT_ID
 
 
-def test_topic_shifts_detects_vocabulary_change():
-    same = make_transcript("x", ["卵を割ってかき混ぜる"] * 8, seg_dur=5)
-    changed = make_transcript("y", ["卵を割ってかき混ぜる", "卵を割ってかき混ぜる", "レンジで温めてチーズをのせる",
-                                    "レンジで温めてチーズをのせる", "盛り付けてパセリを散らす", "盛り付けてパセリを散らす"], seg_dur=5)
-    assert topic_shifts(same) == []
-    assert len(topic_shifts(changed)) >= 2
+def test_brand_is_matched_on_title_only(recipe_rules):
+    v = make_video(3, title="いつもの晩ごはん")
+    tr = make_transcript("vid003", ["ダイソーの", "まず切ります", "完成"])
+    assert extract_features(v, tr, recipe_rules).brand is None          # brand only in ASR -> ignored
+    assert find_brand("簡単レシピ #shorts #ダイソー", recipe_rules) is None  # hashtag only -> ignored
+    assert find_brand("無印のお鍋で", recipe_rules) == "無印"
+    assert title_for_matching("簡単 #shorts #cooking") == "簡単"
+
+
+def test_position_bands(recipe_rules):
+    assert [position_label(x, recipe_rules) for x in (0.0, 0.33, 0.335, 0.34, 0.66, 0.67, 1.0)] == \
+        ["前半", "前半", "前半", "中盤", "中盤", "後半", "後半"]
+    assert position_label(None, recipe_rules) == "なし"

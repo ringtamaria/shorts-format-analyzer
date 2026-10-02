@@ -36,3 +36,31 @@ def env_tmp(tmp_path, monkeypatch):
     monkeypatch.setenv("YOUTUBE_QUOTA_SAFETY_MARGIN", "300")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     return tmp_path
+
+
+RECIPE_RULES = {
+    "opening_types": [
+        {"id": "hype_declaration", "name": "煽り宣言型", "one_line": "煽り語で入って宣言し、間を置かず素材投入へ",
+         "match": {"all": [{"any": ["やばい", "禁断", "マジで"]}, {"any": ["紹介します", "作ります"]}]}},
+        {"id": "warning", "name": "警告・禁止型", "one_line": "否定・禁止で入ってスクロールを止める",
+         "match": {"any": ["しないでください", "作ったらあかん", "食べないで"]}},
+        {"id": "question", "name": "問いかけ型", "one_line": "問いかけで入る", "match": ["知ってる", "[？?]"]},
+    ],
+    "completion_markers": ["完成", "できました", "いただきます"],
+    "bulk_input": ["大量の", r"\d+\s*(キロ|kg|k)"],
+    "brands": ["ダイソー", "無印"],
+    "question_pattern": "[？?]|知ってる",
+    "cta_verbs": ["フォロー", "保存"],
+    "title": {"order": ["数値型", "疑問型"], "patterns": {"数値型": r"\d", "疑問型": "[？?]"}},
+    "thresholds": {"min_type_size": 5, "presence_share": 0.5, "discovery_min_unclassified": 5},
+}
+
+
+@pytest.fixture
+def recipe_rules():
+    from sfa.features import set_rules
+    from sfa.rules import build_rules
+    r = build_rules(RECIPE_RULES)
+    set_rules(r)
+    yield r
+    set_rules(None)
