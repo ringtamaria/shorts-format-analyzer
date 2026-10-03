@@ -91,6 +91,14 @@ class OpeningType:
 
 
 @dataclass
+class Modifier:
+    """Decoration on the opening (煽り, 最上級 ...). Multi-valued, independent of the structural type."""
+    id: str
+    name: str
+    pattern: re.Pattern[str]
+
+
+@dataclass
 class Rules:
     opening_types: list[OpeningType]
     silent_name: str = "無音・テロップ型"
@@ -98,6 +106,7 @@ class Rules:
     silent_max_chars: int = 10
     completion: re.Pattern[str] | None = None
     bulk_input: re.Pattern[str] | None = None
+    modifiers: list[Modifier] = field(default_factory=list)
     brands: list[str] = field(default_factory=list)
     brand_pattern: re.Pattern[str] | None = None
     question: re.Pattern[str] | None = None
@@ -161,6 +170,13 @@ def build_rules(data: dict[str, Any], source: Path | None = None) -> Rules:
     bands_raw = th.get("position_bands") or {}
     bands = {_BAND_ALIASES.get(k, k): (float(v[0]), float(v[1])) for k, v in bands_raw.items()} or None
     brands = [str(b) for b in (data.get("brands", []) or [])]
+    modifiers: list[Modifier] = []
+    for mid, m in (data.get("modifiers", {}) or {}).items():
+        if not isinstance(m, dict) or not m.get("patterns"):
+            raise ValueError(f"modifiers.{mid}: needs 'patterns' (and optionally 'name')")
+        pat = _alt([str(x) for x in m["patterns"]])
+        if pat is not None:
+            modifiers.append(Modifier(str(mid), str(m.get("name", mid)), pat))
     question = data.get("question_pattern")
     r = Rules(
         opening_types=types,
@@ -169,6 +185,7 @@ def build_rules(data: dict[str, Any], source: Path | None = None) -> Rules:
         silent_max_chars=int(silent.get("max_speech_chars", 10)),
         completion=_alt(list(data.get("completion_markers", []) or [])),
         bulk_input=_alt(list(data.get("bulk_input", []) or [])),
+        modifiers=modifiers,
         brands=brands,
         brand_pattern=_literal_alt(brands),
         question=re.compile(question) if question else None,

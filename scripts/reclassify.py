@@ -21,7 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sfa.cli import genre_slug  # noqa: E402
 from sfa.config import load_settings  # noqa: E402
-from sfa.features import get_rules  # noqa: E402
+from sfa.features import get_rules, set_rules  # noqa: E402
+from sfa.rules import load_rules  # noqa: E402
 from sfa.pipeline import analyse, meta_from_run, write_outputs  # noqa: E402
 from sfa.quota import QuotaTracker  # noqa: E402
 from sfa.store import Store  # noqa: E402
@@ -36,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--genre", default=None)
     ap.add_argument("--features", default=None, help="features JSON of the run to reclassify")
+    ap.add_argument("--rules", default=None,
+                    help="rules file to use instead of config/rules.yaml (e.g. a draft kept elsewhere)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     if not args.genre and not args.features:
@@ -66,7 +69,12 @@ def main(argv: list[str] | None = None) -> int:
         (videos.append(v) if v is not None else missing.append(vid))
     if missing:
         print(f"[warn] {len(missing)} videos are not in the cache and are skipped: {missing[:5]}…")
+    if args.rules:
+        set_rules(load_rules(args.rules))
     rules = get_rules()
+    # Runs recorded before round 4 have no collection route / credit lines. Say so instead of leaving a gap.
+    if not run.get("notes"):
+        run["notes"] = ["収集経路・字幕取得 API のクレジット: 再集計元の実行時に記録されていない"]
     print(f"[reclassify] {len(videos)} videos from {src.name}, rules={rules.source}")
     an = analyse(videos, store, lang=run.get("transcript_lang", "ja"), rules=rules)
     for g in an.groups:

@@ -16,12 +16,20 @@ captions mangle katakana proper nouns (ポンデポテイト, 相引きにグ), 
 list cannot hit them in ASR text. Brand is a subject feature, not an opening
 type.
 
+The opening window starts at the FIRST REAL UTTERANCE, not at 0 s: segments
+that only carry caption annotations ([音楽], [Music], [拍手]) are skipped, so a
+video that opens on music is typed by what it says once it starts talking.
+Opening on music is kept as its own feature (music_intro).
+
 Features
   speech              speech | silent | no_transcript | not_fetched
   format_id           opening type id from the rules, "silent" or "unclassified"
   completion          present? + relative position   (旧「結論位置」)
   question / cta      present? + relative position
   bulk_input          present? (independent of the opening type)
+  modifiers           decorations on the opening (煽り, 最上級 ...), multi-valued
+  music_intro         caption annotations ([音楽] ...) before / at the start of speech
+  transcript_source   which backend produced the transcript (hosted, local ...)
   brand               brand found in the title, or None
   speech_density      characters per second
   duration_sec, title_type
@@ -65,6 +73,39 @@ def title_for_matching(title: str) -> str:
 def speech_chars(text: str) -> int:
     """Characters of actual speech: caption annotations, symbols and spaces removed."""
     return len(_RE_NON_CHARS.sub("", _RE_NON_SPEECH.sub("", text or "")))
+
+
+def clean_speech(text: str) -> str:
+    """Opening text without caption annotations, whitespace collapsed."""
+    return re.sub(r"\s+", " ", _RE_NON_SPEECH.sub(" ", text or "")).strip()
+
+
+def first_speech_start(tr: Transcript) -> float | None:
+    """Start of the first segment that contains actual speech (annotation-only segments skipped)."""
+    for s in sorted(tr.segments, key=lambda s: s.start):
+        if speech_chars(s.text) > 0:
+            return s.start
+    return None
+
+
+def opening_from_first_speech(tr: Transcript, window_sec: float) -> tuple[str, float]:
+    """(opening text without annotations, start time of the first utterance)."""
+    t0 = first_speech_start(tr)
+    if t0 is None:
+        return "", 0.0
+    return clean_speech(tr.text_between(t0, t0 + window_sec)), t0
+
+
+def has_music_intro(tr: Transcript, window_sec: float) -> bool:
+    """A caption annotation appears before speech starts, or within the opening window."""
+    t0 = first_speech_start(tr)
+    limit = max(t0 if t0 is not None else 0.0, window_sec)
+    return any(_RE_NON_SPEECH.search(s.text) for s in tr.segments if s.start < limit)
+
+
+def find_modifiers(text: str, rules: Rules | None = None) -> list[str]:
+    r = rules or get_rules()
+    return [m.id for m in r.modifiers if m.pattern.search(text or "")]
 
 
 def classify_speech(tr: Transcript | None, lang: str, rules: Rules | None = None) -> str:
@@ -196,6 +237,10 @@ class Features:
     transcript_chars: int = 0
     n_topic_shifts: int = 0          # reference only
     thumbnail_url: str = ""
+    modifiers: list[str] = field(default_factory=list)
+    music_intro: bool = False
+    transcript_source: str = ""
+    speech_start_sec: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -220,20 +265,21 @@ class Features:
 
 
 def extract_features(video: Video, tr: Transcript | None, rules: Rules | None = None, *,
-                     speech: str | None = None, lang: str = "ja") -> Features:
+                     speech: str | None = None, lang: str = "ja", source: str | None = None) -> Features:
     """``speech`` may be given by the caller (e.g. 'not_fetched'); otherwise it is derived from ``tr``."""
     r = rules or get_rules()
     kind = speech or classify_speech(tr, lang, r)
     base = dict(video_id=video.video_id, title=video.title, url=video.url, duration_sec=video.duration_sec,
                 view_count=video.view_count, title_type=classify_title(video.title, r),
                 brand=find_brand(video.title, r), thumbnail_url=thumbnail_url(video.video_id),
-                language=(tr.language if tr else ""))
+                language=(tr.language if tr else ""),
+                transcript_source=source if source is not None else (tr.source if tr else ""))
     if kind != "speech" or tr is None:
         fid = SILENT_ID if kind in ("silent", "no_transcript") else UNCLASSIFIED_ID
         return Features(**base, speech=kind, format_id=fid, opening_text="", completion_rel=None,
                         question_rel=None, cta_rel=None, bulk_input=False, speech_density=0.0,
                         transcript_chars=tr.total_chars if tr else 0)
-    opening = tr.text_between(0.0, r.opening_window_sec)
+    opening, t0 = opening_from_first_speech(tr, r.opening_window_sec)
     dur = video.duration_sec or max((s.end for s in tr.segments), default=0.0) or 1.0
     return Features(
         **base, speech="speech",
@@ -246,4 +292,7 @@ def extract_features(video: Video, tr: Transcript | None, rules: Rules | None = 
         speech_density=round(tr.total_chars / float(dur), 2),
         transcript_chars=tr.total_chars,
         n_topic_shifts=len(topic_shifts(tr, rules=r)),
+        modifiers=find_modifiers(opening, r),
+        music_intro=has_music_intro(tr, r.opening_window_sec),
+        speech_start_sec=round(t0, 2),
     )

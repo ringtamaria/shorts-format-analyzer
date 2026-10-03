@@ -53,6 +53,7 @@ def _analysed(feats: list[Features]) -> list[Features]:
 
 
 def _overall(feats: list[Features], groups: list[FormatGroup]) -> list[str]:
+    r = get_rules()
     a = _analysed(feats)
     n = len(a)
     if n == 0:
@@ -71,6 +72,10 @@ def _overall(feats: list[Features], groups: list[FormatGroup]) -> list[str]:
         for attr, label in (("completion_rel", "完成の提示"), ("question_rel", "問いかけ"), ("cta_rel", "CTA")):
             L.append(f"- {label}: {_pct(sum(getattr(f, attr) is not None for f in spoken) / m)}の動画にあり")
         L.append(f"- 大量投入: {_pct(sum(f.bulk_input for f in spoken) / m)}の動画にあり")
+        if r.modifiers:
+            L.append("- 冒頭の装飾（1 本に複数付く）: " + "、".join(
+                f"{mod.name} {_pct(sum(mod.id in f.modifiers for f in spoken) / m)}" for mod in r.modifiers))
+        L.append(f"- 冒頭に音楽・効果音: {_pct(sum(f.music_intro for f in spoken) / m)}の動画にあり")
     L.append(f"- タイトルにブランド名: {_pct(sum(f.brand is not None for f in a) / n)}")
     tt = Counter(f.title_type for f in a)
     L.append("- タイトルの型: " + "、".join(f"{k} {_pct(v / n)}" for k, v in tt.most_common()))
@@ -109,6 +114,9 @@ def _type_section(g: FormatGroup, idx: int) -> list[str]:
     for key, label in (("completion", "完成の提示"), ("question", "問いかけ"), ("cta", "CTA")):
         L.append(f"| {label} | {fmt_position(p[key], small=small)} |")
     L.append(f"| 大量投入 | {_pct(p['bulk_input_share'])}の動画にあり |")
+    if p.get("modifiers"):
+        L.append("| 冒頭の装飾（複数付く） | " + "、".join(f"{k} {_pct(v)}" for k, v in p["modifiers"].items()) + " |")
+    L.append(f"| 冒頭に音楽・効果音 | {_pct(p.get('music_intro_share', 0))}の動画にあり |")
     brands = "、".join(f"{b} {c}本" for b, c in p["brands"].items())
     L.append(f"| タイトルにブランド名 | {_pct(p['brand_share'])}" + (f"（{brands}）" if brands else "") + " |")
     L.append(f"| タイトルの型 | {_shares(p['title_type'])} |")
@@ -121,19 +129,24 @@ def _type_section(g: FormatGroup, idx: int) -> list[str]:
     return L
 
 
-def _silent_section(g: FormatGroup, idx: int) -> list[str]:
-    p = g.profile
-    small = g.small_sample
-    kinds = p.get("speech_kinds", {})
-    L = [f"## フォーマット {idx}: {g.name}", ""]
-    L.append(f"該当 {g.size} 本（分析対象の {_pct(g.share)}）。{g.one_line}")
-    if small:
-        L += ["", f"> **注意**: n={g.size} のため傾向の参考値。範囲は出さず中央値のみ示す。"]
-    L += ["", "**この型に入れた根拠**", ""]
+def _silent_evidence(g: FormatGroup) -> list[str]:
+    kinds = g.profile.get("speech_kinds", {})
+    L = ["**この型に入れた根拠**", ""]
     L.append(f"- 字幕が音楽・効果音の表記だけ（発話なしと確認）: {kinds.get('silent', 0)} 本")
     L.append(f"- 字幕がない（発話の有無は未確認）: {kinds.get('no_transcript', 0)} 本")
     if kinds.get("no_transcript"):
         L.append("  - 字幕がないのは、投稿者が字幕を無効にしている場合もある。**納品前にサムネイルと動画で目視確認すること。**")
+    return L
+
+
+def _silent_section(g: FormatGroup, idx: int) -> list[str]:
+    p = g.profile
+    small = g.small_sample
+    L = [f"## フォーマット {idx}: {g.name}", ""]
+    L.append(f"該当 {g.size} 本（分析対象の {_pct(g.share)}）。{g.one_line}")
+    if small:
+        L += ["", f"> **注意**: n={g.size} のため傾向の参考値。範囲は出さず中央値のみ示す。"]
+    L += [""] + _silent_evidence(g)
     L += ["", "**数値プロファイル**" + ("（Q1〜Q3 の範囲、括弧内は中央値）" if not small else "（中央値のみ、参考値）"), ""]
     L += ["| 項目 | 値 |", "|---|---|"]
     L.append(f"| 尺 | {fmt_range(p['duration'], '秒', small=small)} |")
@@ -142,6 +155,29 @@ def _silent_section(g: FormatGroup, idx: int) -> list[str]:
     L.append(f"| タイトルの型 | {_shares(p['title_type'])} |")
     L.append("")
     L += _examples(g, thumbnails=True)
+    return L
+
+
+def _minor_section(groups: list[FormatGroup], min_size: int) -> list[str]:
+    """Types below min_type_size: count, one-liner and URLs only."""
+    if not groups:
+        return []
+    L = ["## 少数の型", "", f"該当が {min_size} 本未満の型。傾向を言えるだけの本数がないため、本数・一言説明・該当動画だけを載せる。", ""]
+    for g in groups:
+        L.append(f"### {g.name}（{g.size} 本、分析対象の {_pct(g.share)}）")
+        L.append("")
+        L.append(g.one_line)
+        L.append("")
+        if g.kind == "silent":
+            L += _silent_evidence(g) + [""]
+        for ex in g.examples[:N_EXAMPLES]:
+            line = f"- [{ex['title']}]({ex['url']}) — {ex['duration_sec']} 秒、{ex['view_count']:,} 回"
+            if g.kind == "silent":
+                line += f"（[サムネイル]({ex['thumbnail_url']})）"
+            L.append(line)
+        if g.size > len(g.examples[:N_EXAMPLES]):
+            L.append(f"- 他 {g.size - len(g.examples[:N_EXAMPLES])} 本")
+        L.append("")
     return L
 
 
@@ -196,24 +232,38 @@ def render_report(meta: ReportMeta, feats: list[Features], groups: list[FormatGr
     L += _overall(feats, groups)
     if groups:
         L += ["## フォーマット一覧", "", "| # | フォーマット | 本数 | 割合 | 一言で |", "|---|---|---|---|---|"]
-        for i, g in enumerate(groups, 1):
+        num = 0
+        for g in groups:
+            if g.kind == "unclassified":
+                label = "—"
+            elif g.size < r.min_type_size:
+                label = "少数"
+            else:
+                num += 1
+                label = str(num)
             note = f"（n={g.size} 参考値）" if g.small_sample and g.kind != "unclassified" else ""
-            num = "—" if g.kind == "unclassified" else str(i)
-            L.append(f"| {num} | {g.name} | {g.size} | {_pct(g.share)} | {note}{g.one_line} |")
+            L.append(f"| {label} | {g.name} | {g.size} | {_pct(g.share)} | {note}{g.one_line} |")
         L.append("")
         idx = 0
+        minor = []
         for g in groups:
-            if g.kind == "type":
-                idx += 1
-                L += _type_section(g, idx)
-            elif g.kind == "silent":
-                idx += 1
-                L += _silent_section(g, idx)
+            if g.kind == "unclassified":
+                continue
+            if g.size < r.min_type_size:
+                minor.append(g)
+                continue
+            idx += 1
+            L += _type_section(g, idx) if g.kind == "type" else _silent_section(g, idx)
+        L += _minor_section(minor, r.min_type_size)
         for g in groups:
             if g.kind == "unclassified":
                 L += _unclassified_section(g, feats)
     L += ["## 取得条件と制約", ""]
-    L.append(f"- 字幕取得手段: `{meta.transcript_backend}`")
+    src = Counter(f.transcript_source for f in a if f.speech in ("speech", "silent") and f.transcript_source)
+    if src:
+        L.append("- 字幕取得手段（字幕が取れた動画）: " + " / ".join(f"`{k}` {v} 本" for k, v in src.most_common()))
+    else:
+        L.append(f"- 字幕取得手段: `{meta.transcript_backend}`")
     if meta.n_other_lang:
         L.append(f"- 言語フィルタ: 字幕の主な言語が `{meta.transcript_lang}` 以外の {meta.n_other_lang} 本を分析対象から除外")
     n_silent_confirmed = sum(f.speech == "silent" for f in a)
@@ -223,7 +273,10 @@ def render_report(meta: ReportMeta, feats: list[Features], groups: list[FormatGr
         L.append(f"- 判定ルール: `{meta.rules_source}`")
     if meta.reclassified_from_cache:
         L.append("- この版は保存済みのデータから再集計した（API は使っていない）")
-    L.append(f"- YouTube Data API 使用量: {meta.quota_used} / {meta.quota_budget} ユニット（当日分）")
+    if meta.reclassified_from_cache:
+        L.append("- YouTube Data API 使用量: この再集計では使っていない（収集時の使用量は収集時のレポートを参照）")
+    else:
+        L.append(f"- YouTube Data API 使用量: {meta.quota_used} / {meta.quota_budget} ユニット（当日分）")
     for n in meta.notes or []:
         L.append(f"- {n}")
     L.append("- **掲載URLは納品前に目視確認すること。** 検索はセーフサーチ無効で行っており、意図しない内容が混じり得る。")

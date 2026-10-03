@@ -71,13 +71,22 @@ def _share(counter: Counter, total: int) -> dict[str, float]:
     return {k: round(v / total, 2) for k, v in counter.most_common()} if total else {}
 
 
+def band_label(q: dict[str, float] | None, rules: Rules) -> str:
+    """Band name for a range: '後半', or '中盤〜後半' when Q1 and Q3 fall in different bands."""
+    if not q:
+        return "なし"
+    lo, hi = position_label(q["q1"], rules), position_label(q["q3"], rules)
+    return lo if lo == hi else f"{lo}〜{hi}"
+
+
 def _presence(members: list[Features], attr: str, rules: Rules) -> dict[str, Any]:
     vals = [getattr(m, attr) for m in members if getattr(m, attr) is not None]
     q = quartiles(vals, 3)
     return {
         "share": round(len(vals) / len(members), 2) if members else 0.0,
         "pos": q,
-        "label": position_label(q["median"], rules) if q else "なし",
+        "label": band_label(q, rules),
+        "median_label": position_label(q["median"], rules) if q else "なし",
     }
 
 
@@ -96,6 +105,11 @@ def profile_group(members: list[Features], rules: Rules | None = None) -> dict[s
         "question": _presence(spoken, "question_rel", r),
         "cta": _presence(spoken, "cta_rel", r),
         "bulk_input_share": round(sum(m.bulk_input for m in spoken) / len(spoken), 2) if spoken else 0.0,
+        # decorations: share of spoken videos carrying each one (multi-valued, so shares do not sum to 1)
+        "modifiers": {mod.name: (round(sum(mod.id in m.modifiers for m in spoken) / len(spoken), 2) if spoken else 0.0)
+                      for mod in r.modifiers},
+        "music_intro_share": round(sum(m.music_intro for m in spoken) / len(spoken), 2) if spoken else 0.0,
+        "transcript_sources": dict(Counter(m.transcript_source for m in members if m.transcript_source)),
         "brand_share": round(sum(m.brand is not None for m in members) / n, 2) if n else 0.0,
         "brands": dict(Counter(m.brand for m in members if m.brand).most_common()),
         "title_type": _share(Counter(m.title_type for m in members), n),
@@ -126,9 +140,9 @@ def fmt_position(p: dict[str, Any], *, small: bool = False) -> str:
         return rate
     pct = lambda x: f"{int(round(x * 100))}"  # noqa: E731
     if small:
-        where = f"{p['label']}（{pct(q['median'])}%地点、参考値）"
+        where = f"{p.get('median_label', p['label'])}（{pct(q['median'])}%地点、参考値）"
     elif pct(q["q1"]) == pct(q["q3"]):
-        where = f"{p['label']}（{pct(q['median'])}%地点）"
+        where = f"{p.get('median_label', p['label'])}（{pct(q['median'])}%地点）"
     else:
         where = f"{p['label']}（{pct(q['q1'])}〜{pct(q['q3'])}%地点）"
     return f"{rate}、尺の{where}"
@@ -162,6 +176,11 @@ def group_recipe(p: dict[str, Any], rules: Rules, *, opening_line: str | None) -
             out.append(f"{label}: {fmt_position(pr, small=small)}")
     if p["bulk_input_share"] >= rules.presence_share:
         out.append(f"大量投入: {int(p['bulk_input_share'] * 100)}%の動画にあり")
+    mods = [f"{name} {int(s * 100)}%" for name, s in p.get("modifiers", {}).items() if s >= rules.presence_share]
+    if mods:
+        out.append("冒頭の装飾: " + "、".join(mods))
+    if p.get("music_intro_share", 0) >= rules.presence_share:
+        out.append(f"冒頭に音楽・効果音: {int(p['music_intro_share'] * 100)}%の動画にあり")
     if p["speech_density"] and not _all_same(p["speech_density"]):
         out.append(f"発話密度: {fmt_range(p['speech_density'], '文字/秒', small=small, nd=1)}")
     if p["duration"] and not _all_same(p["duration"]):
@@ -242,21 +261,22 @@ def cluster_features(feats: list[Features], *, k: int | None = None, max_k: int 
     return [int(x) for x in KMeans(n_clusters=max(1, min(k, n)), n_init=10, random_state=seed).fit_predict(X)]
 
 
-_RE_KANA_WORD = re.compile(r"[ぁ-んァ-ヶー一-龠々]{2,12}")
+_RE_JA_GRAM = re.compile(r"[ぁ-んァ-ヶー一-龠々]+")
 
 
-def common_phrases(texts: list[str], top: int = 10) -> list[tuple[str, int]]:
-    """Character n-grams (2-12) that appear in at least two of the texts, longest-first among ties."""
-    counts: Counter[str] = Counter()
+def common_phrases(texts: list[str], top: int = 10, *, sizes: tuple[int, ...] = (3, 4),
+                   min_docs: int = 2) -> list[tuple[str, int]]:
+    """3-4 character n-grams ranked by DOCUMENT frequency (how many openings contain them).
+
+    Grams found in a single opening are dropped. A 3-gram contained in a kept
+    4-gram with the same document frequency is dropped as redundant.
+    """
+    df: Counter[str] = Counter()
     for t in texts:
-        grams: set[str] = set()
         s = re.sub(r"\s+", "", t)
-        for n in range(2, 13):
-            grams.update(s[i:i + n] for i in range(len(s) - n + 1))
-        counts.update(g for g in grams if _RE_KANA_WORD.fullmatch(g))
-    hits = [(g, c) for g, c in counts.items() if c >= 2]
-    # drop n-grams fully contained in a longer n-gram with the same count
-    hits.sort(key=lambda gc: (-gc[1], -len(gc[0])))
+        grams = {s[i:i + n] for n in sizes for i in range(len(s) - n + 1)}
+        df.update(g for g in grams if _RE_JA_GRAM.fullmatch(g))
+    hits = sorted(((g, c) for g, c in df.items() if c >= min_docs), key=lambda gc: (-gc[1], -len(gc[0]), gc[0]))
     kept: list[tuple[str, int]] = []
     for g, c in hits:
         if any(g in k and c == kc for k, kc in kept):

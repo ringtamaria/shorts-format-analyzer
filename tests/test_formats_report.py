@@ -86,9 +86,16 @@ def test_discovery_only_for_unclassified_and_only_above_threshold(recipe_rules):
     assert "納品物ではない" in md and md.count("最近食べすぎちゃったな。") == 6
 
 
-def test_common_phrases():
-    got = dict(common_phrases(["やばいレシピ紹介します", "禁断のレシピ紹介します", "今日は"]))
-    assert "レシピ紹介します" in got and got["レシピ紹介します"] == 2
+def test_common_phrases_use_3_4_grams_and_document_frequency():
+    texts = ["やばいレシピ紹介します", "禁断のレシピ紹介します", "唐揚げの作り方まずは", "今日はレシピ"]
+    got = common_phrases(texts)
+    grams = dict(got)
+    assert all(3 <= len(g) <= 4 for g in grams)
+    assert grams.get("レシピ") == 3             # in three openings
+    assert grams.get("紹介しま") == 2 or grams.get("介します") == 2
+    assert all(c >= 2 for c in grams.values())  # single-document grams dropped
+    assert [c for _, c in got] == sorted((c for _, c in got), reverse=True)
+    assert "リの" not in grams and "にな" not in grams
 
 
 def _meta(**kw):
@@ -102,7 +109,11 @@ def test_render_report(recipe_rules):
     feats = _feats(recipe_rules)
     groups = classify_formats(feats, recipe_rules)
     md = render_report(_meta(), feats, groups)
-    assert "## フォーマット 1: 煽り宣言型" in md and "## フォーマット 3: 無音・テロップ型" in md
+    assert "## フォーマット 1: 煽り宣言型" in md
+    assert "## 少数の型" in md and "### 警告・禁止型（3 本" in md       # n=3 < 5 -> minor section
+    assert "### 無音・テロップ型（3 本" in md                           # silent n=3 is minor too
+    assert "## フォーマット 2:" not in md
+    assert "| 少数 | 警告・禁止型 | 3 |" in md and "| 少数 | 無音・テロップ型 | 3 |" in md
     assert "字幕が取得できなかった動画" not in md                      # no longer a 'missing data' section
     assert "字幕が音楽・効果音の表記だけ（発話なしと確認）: 1 本" in md
     assert "字幕がない（発話の有無は未確認）: 2 本" in md and "目視確認" in md
@@ -113,3 +124,73 @@ def test_render_report(recipe_rules):
     assert "字幕が日本語以外だった 1 本" in md
     assert "サムネイル" in md and "解析もしていない" in md
     assert "掲載URLは納品前に目視確認すること" in md
+
+
+# ---- round 5 -----------------------------------------------------------------
+
+def test_spanning_band_label(recipe_rules):
+    from sfa.formats import band_label
+    q = {"q1": 0.47, "median": 0.7, "q3": 0.77}
+    assert band_label(q, recipe_rules) == "中盤〜後半"
+    pres = {"share": 0.86, "label": "中盤〜後半", "median_label": "後半", "pos": {**q, "n": 6}}
+    assert fmt_position(pres) == "86%の動画にあり、尺の中盤〜後半（47〜77%地点）"
+    assert fmt_position(pres, small=True) == "86%の動画にあり、尺の後半（70%地点、参考値）"
+    assert band_label({"q1": 0.7, "median": 0.75, "q3": 0.8}, recipe_rules) == "後半"
+
+
+def test_modifiers_are_multi_valued_and_profiled(recipe_rules):
+    from sfa.rules import build_rules
+    from conftest import RECIPE_RULES
+    from sfa.features import set_rules
+    rules = build_rules({**RECIPE_RULES, "modifiers": {
+        "hype": {"name": "煽り", "patterns": ["やば", "禁断"]},
+        "superlative": {"name": "最上級", "patterns": ["世界一", "最強"]}}})
+    set_rules(rules)
+    v = make_video(1)
+    f = extract_features(v, make_transcript(v.video_id, ["やばい世界一のレシピ紹介します", "完成"]), rules)
+    assert f.format_id == "hype_declaration" and sorted(f.modifiers) == ["hype", "superlative"]
+    feats = [extract_features(make_video(i), make_transcript(f"vid{i:03d}", [t, "完成"]), rules)
+             for i, t in enumerate(["やばいレシピ紹介します", "禁断のレシピ紹介します", "やばい最強レシピ作ります",
+                                    "マジでうまいレシピ紹介します", "マジで最強を作ります"], 1)]
+    p = profile_group(feats, rules)
+    assert p["modifiers"] == {"煽り": 0.6, "最上級": 0.4}
+    g = classify_formats(feats, rules)[0]
+    assert any(s.startswith("冒頭の装飾: 煽り 60%") for s in g.recipe)
+    md = render_report(_meta(n_collected=5, n_other_lang=0), feats, [g])
+    assert "| 冒頭の装飾（複数付く） | 煽り 60%、最上級 40% |" in md
+
+
+def test_rules_without_modifiers_still_work(recipe_rules):
+    assert recipe_rules.modifiers == []
+    f = extract_features(make_video(1), make_transcript("vid001", ["やばいレシピ紹介します", "完成"]), recipe_rules)
+    assert f.modifiers == []
+    assert profile_group([f], recipe_rules)["modifiers"] == {}
+
+
+def test_opening_starts_at_first_real_utterance(recipe_rules):
+    v = make_video(1, duration=30)
+    tr = Transcript(v.video_id, "ja", [Segment(0, 2, "[音楽]"), Segment(2, 2.5, "[拍手]"),
+                                       Segment(4.5, 2, "知ってる？これ"), Segment(6.5, 3, "まず切ります"),
+                                       Segment(20, 3, "完成")])
+    f = extract_features(v, tr, recipe_rules)
+    assert f.speech_start_sec == 4.5
+    assert f.opening_text.startswith("知ってる？") and "[音楽]" not in f.opening_text
+    assert f.format_id == "question" and f.music_intro is True
+    plain = extract_features(v, make_transcript(v.video_id, ["知ってる？", "まず切ります", "完成"]), recipe_rules)
+    assert plain.music_intro is False and plain.speech_start_sec == 0.0
+
+
+def test_music_inside_the_opening_window_counts(recipe_rules):
+    v = make_video(2)
+    tr = Transcript(v.video_id, "ja", [Segment(0, 2, "ヒ水1つおくましミ [音楽]"), Segment(2, 5, "まず切ります完成")])
+    f = extract_features(v, tr, recipe_rules)
+    assert f.music_intro is True and "[音楽]" not in f.opening_text
+
+
+def test_transcript_source_breakdown_in_report(recipe_rules):
+    feats = _feats(recipe_rules)
+    for i, f in enumerate(feats):
+        if f.speech in ("speech", "silent"):
+            f.transcript_source = "local" if i < 4 else "hosted"
+    md = render_report(_meta(), feats, classify_formats(feats, recipe_rules))
+    assert "字幕取得手段（字幕が取れた動画）: `hosted`" in md and "`local` 4 本" in md

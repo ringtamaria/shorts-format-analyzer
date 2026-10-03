@@ -321,3 +321,28 @@ def test_phase_a_default_sample_is_ten(env_tmp, fake_api, capsys):
     import check_captions
     assert check_captions.main(["--genres", "レシピ 料理"]) == 0
     assert fake_api.calls.count("captions.list") == 10
+
+
+def test_reclassify_with_rules_option_and_missing_run_info(env_tmp, fake_api, capsys, monkeypatch):
+    """--rules points at a draft elsewhere; old features files without run info get an explicit note."""
+    from conftest import RECIPE_RULES
+    import yaml
+    be = ScriptedBackend()
+    build_report = _use_backend(monkeypatch, be)
+    assert build_report.main(["--genre", "レシピ 料理", "--n", "20"]) == 0
+    fj = next((env_tmp / "out").glob("report_*.features.json"))
+    data = json.loads(fj.read_text())
+    legacy = {"features": data["features"], "lang_excluded": []}  # round-3 shape: no video_ids, no run
+    fj.write_text(json.dumps(legacy, ensure_ascii=False))
+    monkeypatch.setattr(youtube.YouTubeClient, "_get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no API")))
+    draft = env_tmp / "draft.yaml"
+    draft.write_text(yaml.safe_dump({**RECIPE_RULES, "opening_types": [
+        {"id": "speed", "name": "時短宣言型", "match": "分でできる"}]}, allow_unicode=True), encoding="utf-8")
+    import reclassify
+    from sfa.features import set_rules
+    try:
+        assert reclassify.main(["--genre", "レシピ 料理", "--rules", str(draft)]) == 0
+    finally:
+        set_rules(None)
+    md = next((env_tmp / "out").glob("report_*.md")).read_text()
+    assert "時短宣言型" in md and "再集計元の実行時に記録されていない" in md and str(draft) in md

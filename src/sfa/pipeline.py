@@ -33,14 +33,15 @@ class Analysis:
     discovery: list[dict[str, Any]] | None
 
 
-def cached_transcript(store: Store, video_id: str) -> tuple[str, Transcript | None]:
-    """(status, transcript) from the cache. status: ok | unavailable | missing."""
+def cached_transcript(store: Store, video_id: str) -> tuple[str, Transcript | None, str]:
+    """(status, transcript, backend) from the cache. status: ok | unavailable | missing."""
     row = store.get_transcript_row(video_id)
     if row is None or row["status"] not in ("ok", "unavailable"):
-        return "missing", None
+        return "missing", None, ""
     if row["status"] == "unavailable" or not row["segments"]:
-        return "unavailable", None
-    return "ok", Transcript.from_rows(video_id, row["language"] or "", json.loads(row["segments"]), row["backend"])
+        return "unavailable", None, row["backend"] or ""
+    tr = Transcript.from_rows(video_id, row["language"] or "", json.loads(row["segments"]), row["backend"])
+    return "ok", tr, row["backend"] or ""
 
 
 def analyse(videos: list[Video], store: Store, *, lang: str = "ja", rules: Rules | None = None) -> Analysis:
@@ -49,12 +50,12 @@ def analyse(videos: list[Video], store: Store, *, lang: str = "ja", rules: Rules
     other_lang: list[str] = []
     not_fetched: list[str] = []
     for v in videos:
-        status, tr = cached_transcript(store, v.video_id)
+        status, tr, backend = cached_transcript(store, v.video_id)
         if status == "missing":
             not_fetched.append(v.video_id)
-            feats.append(extract_features(v, None, r, speech="not_fetched", lang=lang))
+            feats.append(extract_features(v, None, r, speech="not_fetched", lang=lang, source=""))
             continue
-        f = extract_features(v, tr, r, lang=lang)
+        f = extract_features(v, tr, r, lang=lang, source=backend)
         if f.speech == "other_lang":
             other_lang.append(v.video_id)
         feats.append(f)
@@ -87,6 +88,15 @@ def write_outputs(an: Analysis, meta: ReportMeta, out: Path, *, video_ids: list[
     return paths
 
 
+def _rel(p: Path | None) -> str:
+    if p is None:
+        return ""
+    try:
+        return str(p.resolve().relative_to(Path(__file__).resolve().parents[2]))
+    except ValueError:
+        return str(p)
+
+
 def meta_from_run(run: dict[str, Any], an: Analysis, *, quota_used: int, quota_budget: int,
                   rules: Rules, report_date: date, reclassified: bool) -> ReportMeta:
     return ReportMeta(
@@ -97,6 +107,6 @@ def meta_from_run(run: dict[str, Any], an: Analysis, *, quota_used: int, quota_b
         transcript_lang=run.get("transcript_lang", "ja"), collection_route=run.get("collection_route", "search"),
         partial=bool(run.get("partial")), credits_exhausted=bool(run.get("credits_exhausted")),
         transcripts_aborted=run.get("transcripts_aborted"), transcripts_capped=bool(run.get("transcripts_capped")),
-        rules_source=str(rules.source.relative_to(rules.source.parents[1])) if rules.source else "",
+        rules_source=_rel(rules.source),
         reclassified_from_cache=reclassified, notes=list(run.get("notes") or []),
     )
